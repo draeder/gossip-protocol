@@ -1,6 +1,10 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import inject from '@rollup/plugin-inject'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig({
   plugins: [
@@ -16,6 +20,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      'gossip-protocol': path.resolve(__dirname, '../../src/index.ts'),
       events: 'events',
       util: 'util',
       stream: 'stream-browserify',

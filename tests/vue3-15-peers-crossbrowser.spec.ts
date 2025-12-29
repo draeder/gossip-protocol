@@ -16,7 +16,7 @@ test('Vue3 demo propagates a gossip message across engines', async ({ baseURL },
   const messageWaitMs = Math.min(10_000, Math.floor(budgetMs * 0.75));
 
   const sessionId = `pw-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const url = `${baseURL}/?autostart=1&maxPeers=20&minPeers=3&topology=partial&sessionId=${encodeURIComponent(sessionId)}`;
+  const url = `${baseURL}/?autostart=1&maxPeers=20&minPeers=3&sessionId=${encodeURIComponent(sessionId)}`;
 
   const browsers: { name: string; browser: Browser }[] = [];
 

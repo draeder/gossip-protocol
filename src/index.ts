@@ -47,7 +47,7 @@ export interface PartialMeshConfig {
 
   /**
    * Periodic maintenance interval for autoConnect.
-   * When set, the mesh will periodically attempt to converge to the desired topology.
+    * When set, the mesh will periodically attempt to converge to the desired connection count.
    */
   maintenanceIntervalMs?: number;
 
@@ -750,5 +750,5 @@ export class PartialMesh {
 
 export default PartialMesh;
 
-export { GossipProtocol } from './gossip';
-export type { GossipMessage, GossipProtocolOptions, GossipStats } from './gossip';
+export { GossipProtocol } from './gossip.js';
+export type { GossipMessage, GossipProtocolOptions, GossipStats } from './gossip.js';

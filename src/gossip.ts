@@ -27,14 +27,14 @@ export type GossipStats = {
   discoveredPeers: number;
 };
 
-type MeshLike = {
-  on: (event: 'peer:data', handler: (data: { peerId: string; data: any }) => void) => void;
-  on: (event: 'peer:connected' | 'peer:disconnected', handler: (peerId: string) => void) => void;
-  getClientId: () => string | null;
-  getConnectedPeers: () => string[];
-  getDiscoveredPeers: () => string[];
-  send: (peerId: string, data: string | Buffer | ArrayBuffer) => void;
-};
+interface MeshLike {
+  on(event: 'peer:data', handler: (data: { peerId: string; data: any }) => void): void;
+  on(event: 'peer:connected' | 'peer:disconnected', handler: (peerId: string) => void): void;
+  getClientId(): string | null;
+  getConnectedPeers(): string[];
+  getDiscoveredPeers(): string[];
+  send(peerId: string, data: string | Buffer | ArrayBuffer): void;
+}
 
 type GossipEvents = {
   messageReceived: (data: { message: GossipMessage; local: boolean; fromPeer?: string }) => void;
