@@ -32,12 +32,7 @@ export interface PartialMeshConfig {
    */
   autoConnect?: boolean;
 
-  /**
-   * Connection topology strategy.
-   * - 'partial': maintain between minPeers..maxPeers connections (best-effort)
-   * - 'ring': connect to predecessor/successor in the sorted peer list (token ring)
-   */
-  topology?: 'partial' | 'ring';
+  // Intentionally minimal config surface.
   
   /**
    * ICE servers configuration for STUN/TURN
@@ -111,7 +106,6 @@ export class PartialMesh {
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
-      topology: config.topology ?? 'partial',
       iceServers: config.iceServers ?? [
         { urls: 'stun:stun.l.google.com:19302' }
       ],
@@ -480,7 +474,6 @@ export class PartialMesh {
       }
       this.emit('peer:connected', peerId);
 
-      // In ring mode we often need to immediately attempt the second neighbor.
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
       }
@@ -524,11 +517,6 @@ export class PartialMesh {
    * Maintain the target number of peer connections
    */
   private maintainPeerConnections(): void {
-    if (this.config.topology === 'ring') {
-      this.maintainRingConnections();
-      return;
-    }
-
     const currentPeerCount = this.peers.size;
     const connectingCount = this.connecting.size;
     const totalInProgress = currentPeerCount + connectingCount;
@@ -566,72 +554,6 @@ export class PartialMesh {
       
       for (let i = 0; i < toDrop; i++) {
         this.disconnectFromPeer(peerIds[i]);
-      }
-    }
-  }
-
-  private getRingNeighbors(): { prev?: string; next?: string } {
-    const selfId = this.normalizePeerId(this.clientId);
-    if (!selfId) return {};
-
-    const all = Array.from(this.discoveredPeers)
-      .map((p) => this.normalizePeerId(p))
-      .filter(Boolean);
-
-    // Include self in the ring ordering.
-    all.push(selfId);
-
-    const uniqueSorted = Array.from(new Set(all)).sort();
-    if (uniqueSorted.length <= 1) return {};
-
-    const idx = uniqueSorted.indexOf(selfId);
-    if (idx === -1) return {};
-
-    // For 2 peers, prev === next === other.
-    const prev = uniqueSorted[(idx - 1 + uniqueSorted.length) % uniqueSorted.length];
-    const next = uniqueSorted[(idx + 1) % uniqueSorted.length];
-
-    const prevNeighbor = prev && prev !== selfId ? prev : undefined;
-    const nextNeighbor = next && next !== selfId && next !== prev ? next : undefined;
-
-    return { prev: prevNeighbor, next: nextNeighbor };
-  }
-
-  private maintainRingConnections(): void {
-    const selfId = this.normalizePeerId(this.clientId);
-    if (!selfId) return;
-
-    const neighbors = this.getRingNeighbors();
-    const desired = new Set<string>();
-    if (neighbors.prev) desired.add(neighbors.prev);
-    if (neighbors.next) desired.add(neighbors.next);
-
-    const connected = new Set(this.getConnectedPeers());
-    const connectedOrPending = new Set<string>([...this.peers.keys(), ...this.connecting.values()]);
-
-    // Attempt to connect to missing neighbors, making room if needed.
-    for (const peerId of desired) {
-      if (connectedOrPending.has(peerId)) continue;
-
-      if (this.peers.size >= this.config.maxPeers) {
-        // Make room by dropping a non-desired peer first.
-        const dropCandidate = Array.from(this.peers.keys()).find((p) => !desired.has(p));
-        if (dropCandidate) {
-          this.disconnectFromPeer(dropCandidate);
-        }
-      }
-
-      this.connectToPeer(peerId);
-    }
-
-    // Only enforce strict neighbor-only connections once we have both neighbors connected
-    // (or if we have too many connections).
-    const hasAllDesiredConnected = Array.from(desired).every((p) => connected.has(p));
-    if (hasAllDesiredConnected || this.peers.size > this.config.maxPeers) {
-      for (const peerId of Array.from(this.peers.keys())) {
-        if (!desired.has(peerId)) {
-          this.disconnectFromPeer(peerId);
-        }
       }
     }
   }
@@ -827,3 +749,6 @@ export class PartialMesh {
 }
 
 export default PartialMesh;
+
+export { GossipProtocol } from './gossip';
+export type { GossipMessage, GossipProtocolOptions, GossipStats } from './gossip';

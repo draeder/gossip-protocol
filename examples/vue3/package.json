@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "partialmesh": "file:../..",
+    "gossip-protocol": "file:../..",
     "uniwrtc": "^1.0.7",
     "simple-peer": "^9.11.1",
     "vue": "^3.3.0"

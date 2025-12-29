@@ -1,7 +1,7 @@
 {
-  "name": "partialmesh",
+  "name": "gossip-protocol",
   "version": "1.0.0",
-  "description": "WebRTC peer-to-peer partial mesh networking library with auto-discovery and configurable peer limits using UniWRTC signaling",
+  "description": "Gossip-style message propagation over a WebRTC partial mesh (PartialMesh) with UniWRTC signaling",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -40,7 +40,7 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/draeder/partialmesh.git"
+    "url": "https://github.com/draeder/gossip-protocol.git"
   },
   "dependencies": {
     "simple-peer": "^9.11.1",

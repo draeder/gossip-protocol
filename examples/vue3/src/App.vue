@@ -118,8 +118,8 @@
 </template>
 
 <script>
-import { PartialMesh } from 'partialmesh';
-import { GossipProtocol } from './GossipProtocol.js';
+import { PartialMesh } from 'gossip-protocol';
+import { GossipProtocol } from 'gossip-protocol';
 
 export default {
   name: 'GossipDemo',
@@ -136,7 +136,6 @@ export default {
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 1,
-      topology: 'partial',
       sessionId: 'gossip-protocol-demo',
       messageLog: [],
       autoScroll: true,
@@ -163,13 +162,6 @@ export default {
 
     if (this.minPeers > this.maxPeers) {
       this.minPeers = this.maxPeers;
-    }
-
-    const topologyParam = (params.get('topology') || '').toLowerCase();
-    if (topologyParam === 'ring' || topologyParam === 'token-ring' || topologyParam === 'tokenring') {
-      this.topology = 'ring';
-    } else if (topologyParam === 'partial') {
-      this.topology = 'partial';
     }
 
     const sessionIdParam = params.get('sessionId');
@@ -213,7 +205,6 @@ export default {
           sessionId: this.sessionId,
           minPeers: this.minPeers,
           maxPeers: this.maxPeers,
-          topology: this.topology,
           autoDiscover: true,
           autoConnect: true,
           // If the mesh stays under-connected for too long (common in flaky WebRTC automation),
