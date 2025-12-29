@@ -1,4 +1,4 @@
-import SimplePeer from 'simple-peer/simplepeer.min.js';
+import SimplePeer from 'simple-peer';
 import type { Instance as SimplePeerInstance } from 'simple-peer';
 
 export interface PartialMeshConfig {
