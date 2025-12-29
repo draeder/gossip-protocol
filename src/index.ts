@@ -55,6 +55,15 @@ export interface PartialMeshConfig {
    * When set, the mesh will periodically attempt to converge to the desired topology.
    */
   maintenanceIntervalMs?: number;
+
+  /**
+   * If set (>0), perform a hard reset of all peer connections when the mesh remains
+   * under-connected (connectedPeers < minPeers) for this long while there are enough
+   * discovered peers available to connect to.
+   *
+   * This helps recover from rare stuck negotiation/ICE states in some browsers.
+   */
+  underConnectedResetMs?: number;
 }
 
 export interface PeerConnection {
@@ -65,7 +74,7 @@ export interface PeerConnection {
 }
 
 export type PartialMeshEvents = {
-  'signaling:connected': (data: { clientId: string }) => void;
+  'signaling:connected': (data: { clientId: string; rawClientId?: string }) => void;
   'signaling:disconnected': () => void;
   'signaling:error': (error: any) => void;
   'peer:connected': (peerId: string) => void;
@@ -91,6 +100,8 @@ export class PartialMesh {
   private connecting: Set<string> = new Set();
   private connectionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  private underConnectedSinceMs: number | null = null;
+  private lastHardResetAtMs: number = 0;
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
@@ -105,7 +116,8 @@ export class PartialMesh {
         { urls: 'stun:stun.l.google.com:19302' }
       ],
       connectionTimeoutMs: config.connectionTimeoutMs ?? 25_000,
-      maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2_000
+      maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2_000,
+      underConnectedResetMs: config.underConnectedResetMs ?? 0
     };
 
     // Initialize event handler maps
@@ -169,8 +181,9 @@ export class PartialMesh {
 
     // Set up UniWRTC event handlers
     this.uniwrtcClient.on('connected', (data: { clientId: string }) => {
-      this.clientId = this.normalizePeerId(data.clientId);
-      this.emit('signaling:connected', data);
+      const rawClientId = data?.clientId;
+      this.clientId = this.normalizePeerId(rawClientId);
+      this.emit('signaling:connected', { clientId: this.clientId, rawClientId });
       
       if (this.config.autoDiscover) {
         this.uniwrtcClient.joinSession(this.config.sessionId);
@@ -248,10 +261,88 @@ export class PartialMesh {
     this.maintenanceTimer = setInterval(() => {
       try {
         this.maintainPeerConnections();
+        this.maybeHardResetUnderConnected();
       } catch {
         // ignore
       }
     }, this.config.maintenanceIntervalMs);
+  }
+
+  private maybeHardResetUnderConnected(): void {
+    const thresholdMs = this.config.underConnectedResetMs;
+    if (!thresholdMs || thresholdMs <= 0) return;
+
+    const connected = this.getConnectedPeers().length;
+    const hasEnoughCandidates = this.discoveredPeers.size >= this.config.minPeers;
+    const underConnected = connected < this.config.minPeers && hasEnoughCandidates;
+
+    const now = Date.now();
+
+    if (!underConnected) {
+      this.underConnectedSinceMs = null;
+      return;
+    }
+
+    if (this.underConnectedSinceMs == null) {
+      this.underConnectedSinceMs = now;
+      return;
+    }
+
+    // Avoid repeated rapid resets if the environment is genuinely unable to connect.
+    if (now - this.underConnectedSinceMs < thresholdMs) return;
+    if (now - this.lastHardResetAtMs < thresholdMs) return;
+
+    this.hardReset('under-connected');
+  }
+
+  /**
+   * Hard reset peer connections (keeps signaling + discovered peers).
+   * Useful for recovering from rare stuck negotiation/ICE states.
+   */
+  public hardReset(reason: string = 'manual'): void {
+    this.lastHardResetAtMs = Date.now();
+    this.underConnectedSinceMs = null;
+
+    for (const t of this.connectionTimers.values()) {
+      clearTimeout(t);
+    }
+    this.connectionTimers.clear();
+
+    for (const peerConnection of this.peers.values()) {
+      try {
+        if (!peerConnection.peer.destroyed) peerConnection.peer.destroy();
+      } catch {
+        // ignore
+      }
+    }
+
+    this.peers.clear();
+    this.connecting.clear();
+
+    // Re-announce/join to refresh discovery state in the signaling layer.
+    try {
+      if (this.uniwrtcClient && this.config.sessionId) {
+        this.uniwrtcClient.joinSession(this.config.sessionId);
+      }
+    } catch {
+      // ignore
+    }
+
+    if (this.config.autoConnect) {
+      try {
+        this.maintainPeerConnections();
+      } catch {
+        // ignore
+      }
+    }
+
+    // Best-effort debug signal.
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(`[PartialMesh] hardReset(${reason}) clientId=${this.clientId ?? ''} discovered=${this.discoveredPeers.size}`);
+    } catch {
+      // ignore
+    }
   }
 
   /**
@@ -724,6 +815,8 @@ export class PartialMesh {
     this.connecting.clear();
     this.discoveredPeers.clear();
     this.clientId = null;
+    this.underConnectedSinceMs = null;
+    this.lastHardResetAtMs = 0;
 
     // Disconnect from signaling server
     if (this.uniwrtcClient) {

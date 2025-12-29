@@ -215,15 +215,18 @@ export default {
           maxPeers: this.maxPeers,
           topology: this.topology,
           autoDiscover: true,
-          autoConnect: true
+          autoConnect: true,
+          // If the mesh stays under-connected for too long (common in flaky WebRTC automation),
+          // force a full peer-connection reset to recover.
+          underConnectedResetMs: 30_000
         });
 
         this.gossip = new GossipProtocol(this.mesh);
 
         // Mesh events
         this.mesh.on('signaling:connected', (data) => {
-          this.clientId = data.clientId;
-          this.addLog('signaling', `Connected to signaling server`, data.clientId);
+          this.clientId = (data.clientId || '').trim();
+          this.addLog('signaling', `Connected to signaling server`, this.clientId);
           this.updateStats();
         });
 
