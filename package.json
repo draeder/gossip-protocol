@@ -1,7 +1,7 @@
 {
   "name": "gossip-protocol",
   "version": "1.0.0",
-  "description": "Gossip-style message propagation over a WebRTC partial mesh (PartialMesh) with UniWRTC signaling",
+  "description": "Gossip-style message propagation over a WebRTC partial mesh (PartialMesh) with FreeRTC signaling",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -34,7 +34,7 @@
     "partial-mesh",
     "signaling",
     "auto-discovery",
-    "uniwrtc"
+    "freertc"
   ],
   "author": "",
   "license": "ISC",
@@ -43,18 +43,14 @@
     "url": "https://github.com/draeder/gossip-protocol.git"
   },
   "dependencies": {
-    "simple-peer": "^9.11.1",
-    "uniwrtc": "^1.0.7"
+    "freertc": "github:draeder/freertc",
+    "unsea": "^1.1.2"
   },
   "devDependencies": {
     "@types/node": "^25.0.3",
-    "@types/simple-peer": "^9.11.9",
     "@playwright/test": "^1.55.0",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vite": "^7.3.0"
-  },
-  "peerDependencies": {
-    "uniwrtc": "^1.0.7"
   }
 }

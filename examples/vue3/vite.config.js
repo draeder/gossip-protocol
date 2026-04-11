@@ -29,6 +29,6 @@ export default defineConfig({
     }
   },
   optimizeDeps: {
-    include: ['simple-peer', 'events', 'util', 'stream-browserify', 'buffer', 'process']
+    include: ['events', 'util', 'stream-browserify', 'buffer', 'process']
   }
 })

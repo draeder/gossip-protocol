@@ -201,7 +201,7 @@ export default {
         this.showStatus('Connecting...', 'Initializing PartialMesh with Gossip Protocol...', 'connecting');
 
         this.mesh = new PartialMesh({
-          signalingServer: 'wss://signal.peer.ooo',
+          signalingServer: 'wss://peer.ooo/ws',
           sessionId: this.sessionId,
           minPeers: this.minPeers,
           maxPeers: this.maxPeers,

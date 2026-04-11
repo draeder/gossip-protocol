@@ -33,7 +33,7 @@ interface MeshLike {
   getClientId(): string | null;
   getConnectedPeers(): string[];
   getDiscoveredPeers(): string[];
-  send(peerId: string, data: string | Buffer | ArrayBuffer): void;
+  send(peerId: string, data: string | ArrayBuffer | ArrayBufferView): void;
 }
 
 type GossipEvents = {

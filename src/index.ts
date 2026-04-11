@@ -1,5 +1,4 @@
-import SimplePeer from 'simple-peer';
-import type { Instance as SimplePeerInstance } from 'simple-peer';
+import FreeRTCClientAdapter from './freertc-client-adapter.js';
 
 export interface PartialMeshConfig {
   /**
@@ -13,7 +12,7 @@ export interface PartialMeshConfig {
   maxPeers?: number;
   
   /**
-   * UniWRTC signaling server URL
+    * FreeRTC signaling server URL
    */
   signalingServer?: string;
   
@@ -63,7 +62,6 @@ export interface PartialMeshConfig {
 
 export interface PeerConnection {
   id: string;
-  peer: SimplePeerInstance;
   connected: boolean;
   initiator: boolean;
 }
@@ -83,12 +81,12 @@ export type PartialMeshEvents = {
 /**
  * PartialMesh - WebRTC peer-to-peer partial mesh networking library
  * 
- * Uses UniWRTC for signaling and maintains a configurable number of peer connections.
+ * Uses FreeRTC for signaling and maintains a configurable number of peer connections.
  */
 export class PartialMesh {
   private config: Required<PartialMeshConfig>;
   private peers: Map<string, PeerConnection> = new Map();
-  private uniwrtcClient: any = null;
+  private signalingClient: any = null;
   private discoveredPeers: Set<string> = new Set();
   private clientId: string | null = null;
   private eventHandlers: Map<keyof PartialMeshEvents, Set<Function>> = new Map();
@@ -102,7 +100,7 @@ export class PartialMesh {
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
-      signalingServer: config.signalingServer ?? 'wss://signal.peer.ooo',
+      signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
@@ -137,50 +135,25 @@ export class PartialMesh {
    * Initialize and connect to the signaling server
    */
   async init(): Promise<void> {
-    // Dynamically import UniWRTC client
-    const { default: UniWRTCClient } = await import('uniwrtc/client-browser.js');
+    // Let FreeRTC client manage query params such as networkId.
+    const url = new URL(this.config.signalingServer);
+    if (url.protocol === 'https:') url.protocol = 'wss:';
+    if (url.protocol === 'http:') url.protocol = 'ws:';
+    const signalingUrl = url.toString();
 
-    // UniWRTC's Cloudflare deployment (signal.peer.ooo) uses a Worker route that upgrades
-    // WebSocket connections on `/ws` and routes by `?room=`.
-    // Expected form: `wss://signal.peer.ooo/ws?room=<sessionId>`
-    let signalingUrl = this.config.signalingServer;
-    if (signalingUrl.includes('signal.peer.ooo')) {
-      const url = new URL(signalingUrl);
-
-      // Normalize scheme to ws/wss if user provided http/https.
-      if (url.protocol === 'https:') url.protocol = 'wss:';
-      if (url.protocol === 'http:') url.protocol = 'ws:';
-
-      // Normalize path to /ws (Cloudflare Worker expects this endpoint).
-      const normalizedPath = url.pathname.replace(/\/+$/, '');
-      if (normalizedPath === '' || normalizedPath === '/') {
-        url.pathname = '/ws';
-      } else if (normalizedPath !== '/ws') {
-        // If a different path was supplied, prefer /ws for signal.peer.ooo.
-        url.pathname = '/ws';
-      }
-
-      // Ensure room param exists.
-      if (!url.searchParams.get('room')) {
-        url.searchParams.set('room', this.config.sessionId);
-      }
-
-      signalingUrl = url.toString();
-    }
-
-    this.uniwrtcClient = new UniWRTCClient(signalingUrl, {
-      autoReconnect: true,
-      reconnectDelay: 3000
+    this.signalingClient = new FreeRTCClientAdapter(signalingUrl, {
+      networkId: this.config.sessionId,
+      peerId: globalThis.crypto?.randomUUID?.() ?? undefined
     });
 
-    // Set up UniWRTC event handlers
-    this.uniwrtcClient.on('connected', (data: { clientId: string }) => {
+    // Set up signaling event handlers
+    this.signalingClient.on('connected', (data: { clientId: string }) => {
       const rawClientId = data?.clientId;
       this.clientId = this.normalizePeerId(rawClientId);
       this.emit('signaling:connected', { clientId: this.clientId, rawClientId });
       
       if (this.config.autoDiscover) {
-        this.uniwrtcClient.joinSession(this.config.sessionId);
+        this.signalingClient.joinSession(this.config.sessionId);
       }
 
       if (this.config.autoConnect) {
@@ -188,11 +161,11 @@ export class PartialMesh {
       }
     });
 
-    this.uniwrtcClient.on('disconnected', () => {
+    this.signalingClient.on('disconnected', () => {
       this.emit('signaling:disconnected');
     });
 
-    this.uniwrtcClient.on('joined', (data: { sessionId: string; clients: string[] }) => {
+    this.signalingClient.on('joined', (data: { sessionId: string; clients: string[] }) => {
       // Add existing peers to discovered list
       const selfId = this.normalizePeerId(this.clientId);
       data.clients.forEach((rawPeerId: string) => {
@@ -208,7 +181,7 @@ export class PartialMesh {
       }
     });
 
-    this.uniwrtcClient.on('peer-joined', (data: { peerId: string }) => {
+    this.signalingClient.on('peer-joined', (data: { peerId: string }) => {
       const selfId = this.normalizePeerId(this.clientId);
       const peerId = this.normalizePeerId(data.peerId);
       if (peerId && peerId !== selfId) {
@@ -221,31 +194,71 @@ export class PartialMesh {
       }
     });
 
-    this.uniwrtcClient.on('peer-left', (data: { peerId: string }) => {
+    this.signalingClient.on('peer-left', (data: { peerId: string }) => {
       const peerId = this.normalizePeerId(data.peerId);
       if (!peerId) return;
       this.discoveredPeers.delete(peerId);
       this.removePeer(peerId, true);
     });
 
-    this.uniwrtcClient.on('offer', async (data: { peerId: string; offer: RTCSessionDescriptionInit }) => {
-      await this.handleOffer(data.peerId, data.offer);
+    this.signalingClient.on('rtc:connected', (data: { peerId: string }) => {
+      const peerId = this.normalizePeerId(data.peerId);
+      if (!peerId) return;
+      let peerConnection = this.peers.get(peerId);
+      if (!peerConnection) {
+        // Inbound connection — FreeRTC accepted and fully established without us initiating.
+        peerConnection = { id: peerId, connected: false, initiator: false };
+        this.peers.set(peerId, peerConnection);
+      }
+      if (peerConnection.connected) return; // guard against duplicate events
+      const t = this.connectionTimers.get(peerId);
+      if (t) {
+        clearTimeout(t);
+        this.connectionTimers.delete(peerId);
+      }
+      peerConnection.connected = true;
+      this.connecting.delete(peerId);
+      this.emit('peer:connected', peerId);
+
+      if (this.config.autoConnect) {
+        this.maintainPeerConnections();
+      }
+
+      if (this.getConnectedPeers().length >= this.config.minPeers) {
+        this.emit('mesh:ready');
+      }
     });
 
-    this.uniwrtcClient.on('answer', async (data: { peerId: string; answer: RTCSessionDescriptionInit }) => {
-      await this.handleAnswer(data.peerId, data.answer);
+    this.signalingClient.on('rtc:disconnected', (data: { peerId: string }) => {
+      const peerId = this.normalizePeerId(data.peerId);
+      if (!peerId) return;
+      // FreeRTC already closed the connection; clean up tracking state only.
+      const peerConnection = this.peers.get(peerId);
+      if (peerConnection) {
+        const t = this.connectionTimers.get(peerId);
+        if (t) {
+          clearTimeout(t);
+          this.connectionTimers.delete(peerId);
+        }
+        this.peers.delete(peerId);
+        this.connecting.delete(peerId);
+        this.emit('peer:disconnected', peerId);
+        if (this.config.autoConnect) {
+          this.maintainPeerConnections();
+        }
+      }
     });
 
-    this.uniwrtcClient.on('ice-candidate', async (data: { peerId: string; candidate: RTCIceCandidateInit }) => {
-      await this.handleIceCandidate(data.peerId, data.candidate);
+    this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
+      this.emit('peer:data', data);
     });
 
-    this.uniwrtcClient.on('error', (error: any) => {
+    this.signalingClient.on('error', (error: any) => {
       this.emit('signaling:error', error);
     });
 
     // Connect to the signaling server
-    await this.uniwrtcClient.connect();
+    this.signalingClient.connect();
   }
 
   private startMaintenanceLoop(): void {
@@ -302,9 +315,9 @@ export class PartialMesh {
     }
     this.connectionTimers.clear();
 
-    for (const peerConnection of this.peers.values()) {
+    for (const peerId of this.peers.keys()) {
       try {
-        if (!peerConnection.peer.destroyed) peerConnection.peer.destroy();
+        this.signalingClient?.closeConnection(peerId);
       } catch {
         // ignore
       }
@@ -315,8 +328,8 @@ export class PartialMesh {
 
     // Re-announce/join to refresh discovery state in the signaling layer.
     try {
-      if (this.uniwrtcClient && this.config.sessionId) {
-        this.uniwrtcClient.joinSession(this.config.sessionId);
+      if (this.signalingClient && this.config.sessionId) {
+        this.signalingClient.joinSession(this.config.sessionId);
       }
     } catch {
       // ignore
@@ -340,176 +353,47 @@ export class PartialMesh {
   }
 
   /**
-   * Handle incoming WebRTC offer
-   */
-  private async handleOffer(peerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
-    const selfId = this.normalizePeerId(this.clientId);
-    const normalizedPeerId = this.normalizePeerId(peerId);
-    if (!normalizedPeerId || normalizedPeerId === selfId) return;
-
-    let peerConnection = this.peers.get(normalizedPeerId);
-
-    // If both sides tried to initiate at once, prefer accepting the remote offer.
-    // Simple-peer can get stuck if an initiator receives an offer while negotiating.
-    if (peerConnection?.initiator) {
-      try {
-        peerConnection.peer.destroy();
-      } catch {
-        // ignore
-      }
-      // Ensure timers/state are cleaned up.
-      this.removePeer(normalizedPeerId, false);
-      peerConnection = undefined;
-    }
-
-    if (!peerConnection) {
-      // Create peer connection as non-initiator
-      peerConnection = this.createPeerConnection(normalizedPeerId, false);
-    }
-
-    try {
-      peerConnection.peer.signal(offer);
-    } catch (err) {
-      console.error(`Error signaling offer from peer ${peerId}:`, err);
-    }
-  }
-
-  /**
-   * Handle incoming WebRTC answer
-   */
-  private async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
-    const selfId = this.normalizePeerId(this.clientId);
-    const normalizedPeerId = this.normalizePeerId(peerId);
-    if (!normalizedPeerId || normalizedPeerId === selfId) return;
-
-    const peerConnection = this.peers.get(normalizedPeerId);
-
-    // If we don't have a connection for this peer yet, ignore.
-    if (!peerConnection) return;
-
-    try {
-      peerConnection.peer.signal(answer);
-    } catch (err) {
-      console.error(`Error signaling answer from peer ${peerId}:`, err);
-    }
-  }
-
-  /**
-   * Handle incoming ICE candidate
-   */
-  private async handleIceCandidate(peerId: string, candidate: any): Promise<void> {
-    const selfId = this.normalizePeerId(this.clientId);
-    const normalizedPeerId = this.normalizePeerId(peerId);
-    if (!normalizedPeerId || normalizedPeerId === selfId) return;
-
-    const peerConnection = this.peers.get(normalizedPeerId);
-
-    if (peerConnection) {
-      try {
-        peerConnection.peer.signal({ type: 'candidate', candidate: candidate });
-      } catch (err) {
-        console.error(`Error adding ICE candidate from peer ${peerId}:`, err);
-      }
-    }
-  }
-
-  /**
    * Create a new peer connection
    */
   private createPeerConnection(peerId: string, initiator: boolean): PeerConnection {
-    const peer = new SimplePeer({
-      initiator,
-      trickle: true,
-      config: {
-        iceServers: this.config.iceServers
-      }
-    });
-
     const peerConnection: PeerConnection = {
       id: peerId,
-      peer,
       connected: false,
       initiator
     };
 
-    // If a connection stalls (no 'connect' / 'error' / 'close'), tear it down and retry.
+    // If a connection stalls, tear it down and retry.
     const existingTimer = this.connectionTimers.get(peerId);
     if (existingTimer) clearTimeout(existingTimer);
 
     const timer = setTimeout(() => {
       const current = this.peers.get(peerId);
       if (!current || current.connected) return;
-      if (current.peer.destroyed) return;
 
       this.connecting.delete(peerId);
       this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
-      try {
-        current.peer.destroy();
-      } catch {
-        // ignore
-      }
       this.removePeer(peerId);
     }, this.config.connectionTimeoutMs);
 
     this.connectionTimers.set(peerId, timer);
-
-    peer.on('signal', (signal: any) => {
-      // Send signal through UniWRTC
-      if (signal.type === 'offer') {
-        this.uniwrtcClient.sendOffer(signal, peerId);
-      } else if (signal.type === 'answer') {
-        this.uniwrtcClient.sendAnswer(signal, peerId);
-      } else if (signal.candidate) {
-        this.uniwrtcClient.sendIceCandidate(signal.candidate, peerId);
-      }
-    });
-
-    peer.on('connect', () => {
-      peerConnection.connected = true;
-      this.connecting.delete(peerId);
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
-      this.emit('peer:connected', peerId);
-
-      if (this.config.autoConnect) {
-        this.maintainPeerConnections();
-      }
-      
-      // Check if we've reached minimum peers
-      if (this.getConnectedPeers().length >= this.config.minPeers) {
-        this.emit('mesh:ready');
-      }
-    });
-
-    peer.on('data', (data: any) => {
-      this.emit('peer:data', { peerId, data });
-    });
-
-    peer.on('close', () => {
-      this.connecting.delete(peerId);
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
-      this.removePeer(peerId);
-    });
-
-    peer.on('error', (err: any) => {
-      this.connecting.delete(peerId);
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
-      this.emit('peer:error', { peerId, error: err });
-      this.removePeer(peerId);
-    });
-
     this.peers.set(peerId, peerConnection);
+
+    if (initiator) {
+      // FreeRTC handles the full offer/answer/ICE exchange internally.
+      this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err: any) => {
+        this.connecting.delete(peerId);
+        const t = this.connectionTimers.get(peerId);
+        if (t) {
+          clearTimeout(t);
+          this.connectionTimers.delete(peerId);
+        }
+        this.emit('peer:error', { peerId, error: err });
+        this.removePeer(peerId);
+      });
+    }
+    // Non-initiator: FreeRTC handles the incoming offer entirely on its own.
+    // We'll receive an rtc:connected event when the data channel opens.
+
     return peerConnection;
   }
 
@@ -605,18 +489,21 @@ export class PartialMesh {
         clearTimeout(t);
         this.connectionTimers.delete(peerId);
       }
-      if (!peerConnection.peer.destroyed) {
-        peerConnection.peer.destroy();
-      }
       this.peers.delete(peerId);
       this.connecting.delete(peerId);
+      // Close the underlying FreeRTC connection (no-op if already closed).
+      try {
+        this.signalingClient?.closeConnection(peerId);
+      } catch {
+        // ignore
+      }
       // Do NOT forget discovered peers on disconnect/close/error.
       // A peer can still be present in the signaling session and should remain eligible for reconnection.
       if (forgetDiscovered) {
         this.discoveredPeers.delete(peerId);
       }
       this.emit('peer:disconnected', peerId);
-      
+
       // Try to maintain minimum peer count
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
@@ -627,10 +514,10 @@ export class PartialMesh {
   /**
    * Send data to a specific peer
    */
-  public send(peerId: string, data: string | Buffer | ArrayBuffer): void {
+  public send(peerId: string, data: string | ArrayBuffer | ArrayBufferView): void {
     const peerConnection = this.peers.get(peerId);
     if (peerConnection && peerConnection.connected) {
-      peerConnection.peer.send(data);
+      this.signalingClient.send(peerId, data);
     } else {
       throw new Error(`Peer ${peerId} is not connected`);
     }
@@ -639,12 +526,8 @@ export class PartialMesh {
   /**
    * Broadcast data to all connected peers
    */
-  public broadcast(data: string | Buffer | ArrayBuffer): void {
-    this.peers.forEach((peerConnection) => {
-      if (peerConnection.connected) {
-        peerConnection.peer.send(data);
-      }
-    });
+  public broadcast(data: string | ArrayBuffer | ArrayBufferView): void {
+    this.signalingClient?.broadcast(data);
   }
 
   /**
@@ -728,11 +611,13 @@ export class PartialMesh {
     this.connectionTimers.clear();
 
     // Close all peer connections
-    this.peers.forEach((peerConnection) => {
-      if (!peerConnection.peer.destroyed) {
-        peerConnection.peer.destroy();
+    for (const peerId of this.peers.keys()) {
+      try {
+        this.signalingClient?.closeConnection(peerId);
+      } catch {
+        // ignore
       }
-    });
+    }
     this.peers.clear();
     this.connecting.clear();
     this.discoveredPeers.clear();
@@ -741,9 +626,9 @@ export class PartialMesh {
     this.lastHardResetAtMs = 0;
 
     // Disconnect from signaling server
-    if (this.uniwrtcClient) {
-      this.uniwrtcClient.disconnect();
-      this.uniwrtcClient = null;
+    if (this.signalingClient) {
+      this.signalingClient.disconnect();
+      this.signalingClient = null;
     }
   }
 }

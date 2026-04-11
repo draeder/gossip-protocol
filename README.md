@@ -62,7 +62,7 @@ Configuration (all optional):
 
 - `minPeers` (default `2`): minimum number of peer connections to maintain.
 - `maxPeers` (default `10`): maximum number of peer connections to maintain.
-- `signalingServer` (default `wss://signal.peer.ooo`): UniWRTC signaling server URL.
+- `signalingServer` (default `wss://peer.ooo/ws`): FreeRTC signaling server URL.
 - `sessionId` (default `default-session`): room ID used for discovery.
 - `autoDiscover` (default `true`): automatically join `sessionId` on signaling connect.
 - `autoConnect` (default `true`): automatically converge to the target connection count.
