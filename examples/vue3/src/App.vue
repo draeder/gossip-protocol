@@ -46,6 +46,7 @@
             <span class="field-label">Min Peers</span>
             <input
               v-model.number="minPeers"
+              @input="onPeerBoundsInput"
               type="number"
               min="1"
               max="50"
@@ -59,6 +60,7 @@
             <span class="field-label">Max Peers</span>
             <input
               v-model.number="maxPeers"
+              @input="onPeerBoundsInput"
               type="number"
               min="1"
               max="50"
@@ -66,6 +68,23 @@
               class="input"
               data-testid="max-peers"
             />
+          </label>
+
+          <label class="field field-topology">
+            <span class="field-label">Topology</span>
+            <select
+              v-model="topology"
+              @change="onTopologyChange"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="topology"
+            >
+              <option value="token-ring">Token Ring (target 2, tolerant 1)</option>
+              <option value="star">Star (1-20)</option>
+              <option value="partial-mesh">Partial Mesh (2-5)</option>
+              <option value="dense-mesh">Dense Mesh (3-10)</option>
+              <option value="custom">Custom</option>
+            </select>
           </label>
         </div>
 
@@ -241,6 +260,7 @@ export default {
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 2,
+      topology: 'token-ring',
       networkName: 'gossip',
       roomSessionId: '',
       signalingServer: 'wss://peer.ooo/ws',
@@ -256,6 +276,18 @@ export default {
   },
   mounted() {
     const params = new URLSearchParams(window.location.search);
+
+    const topologyParam = (params.get('topology') || '').trim().toLowerCase();
+    if (this.isKnownTopology(topologyParam)) {
+      this.topology = topologyParam;
+    }
+
+    const hasMaxPeersParam = params.get('maxPeers') != null;
+    const hasMinPeersParam = params.get('minPeers') != null;
+
+    if (!hasMaxPeersParam && !hasMinPeersParam) {
+      this.applyTopologyPreset(this.topology);
+    }
 
     // Use a browser-local room by default to keep tabs in the same network.
     const storageKey = 'gossip-protocol:room-session-id';
@@ -286,6 +318,8 @@ export default {
       this.minPeers = this.maxPeers;
     }
 
+    this.reconcileTopologyWithPeerBounds();
+
     const networkNameParam = params.get('networkName') || params.get('network');
     if (networkNameParam) {
       this.networkName = networkNameParam;
@@ -306,7 +340,7 @@ export default {
       this.signalingServer = signalingServerParam;
     }
 
-    const autostart = (params.get('autostart') || '').toLowerCase();
+    const autostart = (params.get('autostart') || '1').toLowerCase();
     if (autostart === '1' || autostart === 'true' || autostart === 'yes') {
       this.startMesh();
     }
@@ -344,12 +378,76 @@ export default {
     }
   },
   methods: {
+    topologyPresetBounds(topology) {
+      switch (topology) {
+        case 'token-ring':
+          // Keep ring behavior as the default target while allowing 2-node sessions.
+          return { minPeers: 1, maxPeers: 2 };
+        case 'star':
+          return { minPeers: 1, maxPeers: 20 };
+        case 'partial-mesh':
+          return { minPeers: 2, maxPeers: 5 };
+        case 'dense-mesh':
+          return { minPeers: 3, maxPeers: 10 };
+        default:
+          return null;
+      }
+    },
+
+    isKnownTopology(topology) {
+      return ['token-ring', 'star', 'partial-mesh', 'dense-mesh', 'custom'].includes(topology);
+    },
+
+    normalizePeerBounds(minPeers, maxPeers) {
+      const normalizedMin = Math.max(1, Math.min(50, Number(minPeers) || 1));
+      const normalizedMax = Math.max(1, Math.min(50, Number(maxPeers) || 1));
+      return {
+        minPeers: Math.min(normalizedMin, normalizedMax),
+        maxPeers: Math.max(normalizedMin, normalizedMax)
+      };
+    },
+
+    applyTopologyPreset(topology) {
+      const bounds = this.topologyPresetBounds(topology);
+      if (!bounds) return;
+      const normalized = this.normalizePeerBounds(bounds.minPeers, bounds.maxPeers);
+      this.minPeers = normalized.minPeers;
+      this.maxPeers = normalized.maxPeers;
+    },
+
+    reconcileTopologyWithPeerBounds() {
+      const normalized = this.normalizePeerBounds(this.minPeers, this.maxPeers);
+      this.minPeers = normalized.minPeers;
+      this.maxPeers = normalized.maxPeers;
+
+      const presets = ['token-ring', 'star', 'partial-mesh', 'dense-mesh'];
+      for (const name of presets) {
+        const bounds = this.topologyPresetBounds(name);
+        if (!bounds) continue;
+        if (bounds.minPeers === this.minPeers && bounds.maxPeers === this.maxPeers) {
+          this.topology = name;
+          return;
+        }
+      }
+
+      this.topology = 'custom';
+    },
+
+    onTopologyChange() {
+      if (this.topology === 'custom') return;
+      this.applyTopologyPreset(this.topology);
+    },
+
+    onPeerBoundsInput() {
+      this.reconcileTopologyWithPeerBounds();
+    },
+
     async startMesh() {
       try {
-        const normalizedMin = Math.max(1, Math.min(50, Number(this.minPeers) || 1));
-        const normalizedMax = Math.max(1, Math.min(50, Number(this.maxPeers) || 1));
-        this.minPeers = Math.min(normalizedMin, normalizedMax);
-        this.maxPeers = Math.max(normalizedMin, normalizedMax);
+        const normalized = this.normalizePeerBounds(this.minPeers, this.maxPeers);
+        this.minPeers = normalized.minPeers;
+        this.maxPeers = normalized.maxPeers;
+        this.reconcileTopologyWithPeerBounds();
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
         this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
@@ -708,6 +806,14 @@ section {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
+}
+
+.field-topology {
+  min-width: 280px;
+}
+
+.field-topology .input {
+  min-width: 280px;
 }
 
 .field-label {
@@ -1145,6 +1251,12 @@ section {
     width: 80px;
     height: 80px;
     font-size: 0.9rem;
+  }
+
+  .field-topology,
+  .field-topology .input {
+    min-width: 0;
+    width: 100%;
   }
 }
 </style>
