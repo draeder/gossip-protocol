@@ -75,7 +75,7 @@
             <select
               v-model="topology"
               @change="onTopologyChange"
-              :disabled="isRunning || isConnecting"
+              :disabled="isConnecting"
               class="input"
               data-testid="topology"
             >
@@ -434,8 +434,20 @@ export default {
     },
 
     onTopologyChange() {
-      if (this.topology === 'custom') return;
-      this.applyTopologyPreset(this.topology);
+      const shouldRestart = this.isRunning && !this.isConnecting;
+      if (this.topology !== 'custom') {
+        this.applyTopologyPreset(this.topology);
+      }
+      if (shouldRestart) {
+        this.restartMeshForTopologyChange();
+      }
+    },
+
+    async restartMeshForTopologyChange() {
+      if (this.isConnecting) return;
+      this.showStatus('Reconfiguring...', 'Applying topology and restarting mesh...', 'connecting');
+      this.stopMesh();
+      await this.startMesh();
     },
 
     onPeerBoundsInput() {
