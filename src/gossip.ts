@@ -3,6 +3,12 @@ export type GossipProtocolOptions = {
   maxHops?: number;
   /** Maximum hops for a direct/routed message before it is dropped. Default 20. */
   maxDirectHops?: number;
+  /** Relative weight of coordinate-space distance in CECR hybrid routing (0..1). */
+  cecrCoordinateWeight?: number;
+  /** Maximum age of extrema snapshot before coordinate weight is reduced. */
+  cecrExtremaMaxAgeMs?: number;
+  /** If coordinate drift exceeds this, coordinate routing is strongly de-weighted. */
+  cecrMaxAcceptedDrift?: number;
 };
 
 export type GossipMessage = {
@@ -57,6 +63,13 @@ type GossipEvents = {
   directMessageReceived: (data: { message: DirectMessage }) => void;
 };
 
+type CecrExtrema = {
+  min: bigint;
+  max: bigint;
+  updatedAtMs: number;
+  size: number;
+};
+
 /**
  * GossipProtocol
  *
@@ -70,6 +83,11 @@ export class GossipProtocol {
   private messageLog: Map<string, { timestamp: number; sender: string | null; hops: number }> = new Map();
   private maxHops: number;
   private maxDirectHops: number;
+  private cecrCoordinateWeight: number;
+  private cecrExtremaMaxAgeMs: number;
+  private cecrMaxAcceptedDrift: number;
+  private cecrCurrentExtrema: CecrExtrema | null = null;
+  private cecrPreviousExtrema: CecrExtrema | null = null;
   private seenDirectIds: Set<string> = new Set();
   private callbacks: Partial<Record<keyof GossipEvents, Set<Function>>> = {};
   private peers: Map<string, { connected: boolean; timestamp: number }> = new Map();
@@ -78,6 +96,9 @@ export class GossipProtocol {
     this.mesh = mesh;
     this.maxHops = options.maxHops ?? 5;
     this.maxDirectHops = options.maxDirectHops ?? 20;
+    this.cecrCoordinateWeight = Math.max(0, Math.min(1, options.cecrCoordinateWeight ?? 0.35));
+    this.cecrExtremaMaxAgeMs = Math.max(1_000, options.cecrExtremaMaxAgeMs ?? 20_000);
+    this.cecrMaxAcceptedDrift = Math.max(0.01, Math.min(1, options.cecrMaxAcceptedDrift ?? 0.18));
     this.setupMeshListeners();
   }
 
@@ -225,6 +246,136 @@ export class GossipProtocol {
     return best;
   }
 
+  private peerIdToNumeric(peerId: string): bigint | null {
+    try {
+      const hex = peerId.replace(/-/g, '').toLowerCase();
+      if (!hex) return null;
+      const compact = hex.slice(0, 16).padEnd(16, '0');
+      return BigInt('0x' + compact);
+    } catch {
+      return null;
+    }
+  }
+
+  private updateCecrExtremaSnapshot(): CecrExtrema | null {
+    const universe = new Set<string>();
+    const self = this.mesh.getClientId();
+    if (self) universe.add(self);
+    for (const peerId of this.mesh.getConnectedPeers()) universe.add(peerId);
+    for (const peerId of this.mesh.getGlobalPeers?.() ?? []) universe.add(peerId);
+
+    let min: bigint | null = null;
+    let max: bigint | null = null;
+    let count = 0;
+    for (const peerId of universe) {
+      const value = this.peerIdToNumeric(peerId);
+      if (value == null) continue;
+      if (min == null || value < min) min = value;
+      if (max == null || value > max) max = value;
+      count++;
+    }
+
+    if (min == null || max == null || count < 2 || min === max) {
+      return null;
+    }
+
+    const next: CecrExtrema = {
+      min,
+      max,
+      updatedAtMs: Date.now(),
+      size: count,
+    };
+
+    if (!this.cecrCurrentExtrema || this.cecrCurrentExtrema.min !== next.min || this.cecrCurrentExtrema.max !== next.max || this.cecrCurrentExtrema.size !== next.size) {
+      this.cecrPreviousExtrema = this.cecrCurrentExtrema;
+      this.cecrCurrentExtrema = next;
+    } else {
+      this.cecrCurrentExtrema.updatedAtMs = next.updatedAtMs;
+    }
+
+    return this.cecrCurrentExtrema;
+  }
+
+  private coordinateFor(peerId: string, extrema: CecrExtrema): number | null {
+    const value = this.peerIdToNumeric(peerId);
+    if (value == null) return null;
+    const span = extrema.max - extrema.min;
+    if (span <= 0n) return null;
+    return Number(value - extrema.min) / Number(span);
+  }
+
+  private effectiveCecrCoordinateWeight(targetPeerId: string): number {
+    let weight = this.cecrCoordinateWeight;
+    const current = this.cecrCurrentExtrema ?? this.updateCecrExtremaSnapshot();
+    if (!current) return 0;
+
+    const ageMs = Date.now() - current.updatedAtMs;
+    if (ageMs > this.cecrExtremaMaxAgeMs) {
+      // Bound routing drift under stale extrema by relying more on XOR routing.
+      weight *= 0.2;
+    }
+
+    if (this.cecrPreviousExtrema) {
+      const prevCoord = this.coordinateFor(targetPeerId, this.cecrPreviousExtrema);
+      const nextCoord = this.coordinateFor(targetPeerId, current);
+      if (prevCoord != null && nextCoord != null) {
+        const drift = Math.abs(prevCoord - nextCoord);
+        if (drift > this.cecrMaxAcceptedDrift) {
+          weight *= 0.15;
+        }
+      }
+    }
+
+    return Math.max(0, Math.min(1, weight));
+  }
+
+  private closestPeerHybrid(target: string, exclude?: string): string | null {
+    const connected = this.mesh.getConnectedPeers().filter(p => p !== exclude);
+    if (connected.length === 0) return null;
+
+    const coordWeight = this.effectiveCecrCoordinateWeight(target);
+    if (coordWeight <= 0.001) {
+      return this.closestPeerTo(target, exclude);
+    }
+
+    const extrema = this.cecrCurrentExtrema ?? this.updateCecrExtremaSnapshot();
+    const targetCoord = extrema ? this.coordinateFor(target, extrema) : null;
+    if (!extrema || targetCoord == null) {
+      return this.closestPeerTo(target, exclude);
+    }
+
+    let maxXor = 1n;
+    const xorDistances = new Map<string, bigint>();
+    for (const peerId of connected) {
+      try {
+        const d = this.xorDistance(peerId, target);
+        xorDistances.set(peerId, d);
+        if (d > maxXor) maxXor = d;
+      } catch {
+        xorDistances.set(peerId, maxXor);
+      }
+    }
+
+    let bestPeer: string | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const peerId of connected) {
+      const dXor = xorDistances.get(peerId) ?? maxXor;
+      const xorScore = Number(dXor) / Number(maxXor || 1n);
+
+      const peerCoord = this.coordinateFor(peerId, extrema);
+      const ratioScore = peerCoord == null ? 1 : Math.abs(peerCoord - targetCoord);
+
+      const score = (1 - coordWeight) * xorScore + coordWeight * ratioScore;
+      if (score < bestScore) {
+        bestScore = score;
+        bestPeer = peerId;
+      }
+    }
+
+    return bestPeer ?? this.closestPeerTo(target, exclude);
+  }
+
   /**
    * Send a direct message to a specific peer, routed through the mesh via XOR distance.
    * Delivers even if there is no direct connection to the target.
@@ -269,8 +420,8 @@ export class GossipProtocol {
 
     if (message.hops >= message.maxHops) return;
 
-    // XOR-route to closest connected peer (excluding the peer we got it from)
-    const next = this.closestPeerTo(message.to, fromPeerId ?? undefined);
+    // Hybrid CECR routing: coordinate proximity (local) + XOR (global backbone).
+    const next = this.closestPeerHybrid(message.to, fromPeerId ?? undefined);
     if (!next) return;
 
     try {

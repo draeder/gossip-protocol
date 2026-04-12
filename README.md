@@ -16,13 +16,11 @@ What is implemented today:
 
 - In-band membership gossip so peers gradually converge on a larger shared peer set than their immediate connections.
 - Gossip broadcast with adaptive fan-out based on estimated network size.
-- XOR-routed direct messages that can traverse intermediate peers.
+- Hybrid direct routing that combines coordinate-space proximity with XOR distance, with bounded-drift fallback behavior.
 
 What is not implemented today:
 
-- Extremal coordinate embedding using global min/max.
-- Coordinate-proximity routing decisions.
-- Formal CECR stability logic around stale extrema and bounded drift.
+- Formal proofs/analysis tooling for CECR stability bounds under arbitrary churn.
 
 ## Install
 
@@ -134,12 +132,16 @@ Configuration:
 
 - `maxHops` (default `5`): base maximum hops for broadcast gossip.
 - `maxDirectHops` (default `20`): maximum hops for a direct/routed message before it is dropped.
+- `cecrCoordinateWeight` (default `0.35`): relative routing weight for coordinate-space distance vs XOR distance.
+- `cecrExtremaMaxAgeMs` (default `20000`): age threshold for extrema snapshots before coordinate influence is reduced.
+- `cecrMaxAcceptedDrift` (default `0.18`): drift threshold where coordinate influence is strongly de-weighted.
 
 Behavior:
 
 - Broadcast fan-out scales with estimated network size using $\max(2, \lceil \log_2(N+1) \rceil)$.
 - Broadcast max hops is also scaled upward based on estimated network size.
-- Direct messages are routed toward the connected peer with the smallest XOR distance to the target peer ID.
+- Direct messages use hybrid CECR next-hop selection: coordinate-space proximity (from converged global extrema) plus XOR distance.
+- Under stale/extrema-shift conditions, coordinate weighting is reduced so routing falls back toward XOR behavior.
 
 Methods:
 
