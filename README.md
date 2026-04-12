@@ -18,11 +18,13 @@ What is implemented today:
 - Symmetric membership removal on signaling `peer-left` events.
 - Gossip broadcast with adaptive fan-out based on estimated network size.
 - Hybrid direct routing that combines coordinate-space proximity with XOR distance, with bounded-drift fallback behavior.
+- Canonical global peer-set hashing and CECR extrema state exchange.
+- Coordinate-space routing is gated on global agreement of canonical set hash and extrema across connected peers.
+- Full-width peer-ID XOR comparisons (no 64-bit truncation).
 
 What is not implemented today:
 
 - Formal proofs/analysis tooling for CECR stability bounds under arbitrary churn.
-- A canonical globally synchronized membership digest/hash.
 
 ## Install
 
@@ -137,13 +139,15 @@ Configuration:
 - `cecrCoordinateWeight` (default `0.35`): relative routing weight for coordinate-space distance vs XOR distance.
 - `cecrExtremaMaxAgeMs` (default `20000`): age threshold for extrema snapshots before coordinate influence is reduced.
 - `cecrMaxAcceptedDrift` (default `0.18`): drift threshold where coordinate influence is strongly de-weighted.
+- `cecrRequireConsensus` (default `true`): requires all connected peers to report the same canonical set hash and extrema before coordinate-space routing is applied.
 
 Behavior:
 
 - Broadcast fan-out scales with estimated network size using $\max(2, \lceil \log_2(N+1) \rceil)$.
 - Broadcast max hops is also scaled upward based on estimated network size.
-- Direct messages use hybrid CECR next-hop selection: coordinate-space proximity (from each node's local extrema snapshot) plus XOR distance.
+- Direct messages use hybrid CECR next-hop selection: coordinate-space proximity (from canonical globally-agreed extrema) plus XOR distance.
 - Under stale/extrema-shift conditions, coordinate weighting is reduced so routing falls back toward XOR behavior.
+- If CECR consensus is not established yet, routing uses XOR-only next-hop selection until agreement is observed.
 
 Methods:
 
@@ -229,4 +233,3 @@ node scripts/run-e2e-loop.mjs --runs 5 --timeoutMs 15000 --spec tests/vue3-15-pe
 - The default signaling endpoint is a third-party service. Treat room IDs and client IDs as metadata visible to that signaling layer.
 - This is not a security boundary. If you need authz/authn, abuse protection, persistence, or app-layer encryption, add them in your application.
 - Membership convergence is eventually consistent and node-local. A peer may temporarily know about fewer peers than another peer.
-- CECR routing in this implementation uses local extrema snapshots from each node's current membership view, not a globally synchronized set hash.

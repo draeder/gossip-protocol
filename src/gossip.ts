@@ -9,6 +9,8 @@ export type GossipProtocolOptions = {
   cecrExtremaMaxAgeMs?: number;
   /** If coordinate drift exceeds this, coordinate routing is strongly de-weighted. */
   cecrMaxAcceptedDrift?: number;
+  /** Require canonical global-set/extrema agreement across connected peers before coordinate routing. */
+  cecrRequireConsensus?: boolean;
 };
 
 export type GossipMessage = {
@@ -31,6 +33,17 @@ export type DirectMessage = {
   hops: number;
   maxHops: number;
   timestamp: number;
+};
+
+type CecrStateMessage = {
+  id: string;
+  type: 'cecr-state';
+  from: string;
+  timestamp: number;
+  setHash: string;
+  minHex: string;
+  maxHex: string;
+  size: number;
 };
 
 export type GossipStats = {
@@ -68,6 +81,15 @@ type CecrExtrema = {
   max: bigint;
   updatedAtMs: number;
   size: number;
+  setHash: string;
+};
+
+type CecrRemoteState = {
+  setHash: string;
+  min: bigint;
+  max: bigint;
+  size: number;
+  updatedAtMs: number;
 };
 
 /**
@@ -86,8 +108,11 @@ export class GossipProtocol {
   private cecrCoordinateWeight: number;
   private cecrExtremaMaxAgeMs: number;
   private cecrMaxAcceptedDrift: number;
+  private cecrRequireConsensus: boolean;
   private cecrCurrentExtrema: CecrExtrema | null = null;
   private cecrPreviousExtrema: CecrExtrema | null = null;
+  private cecrRemoteStates: Map<string, CecrRemoteState> = new Map();
+  private cecrSyncTimer: ReturnType<typeof setInterval> | null = null;
   private seenDirectIds: Set<string> = new Set();
   private callbacks: Partial<Record<keyof GossipEvents, Set<Function>>> = {};
   private peers: Map<string, { connected: boolean; timestamp: number }> = new Map();
@@ -99,7 +124,9 @@ export class GossipProtocol {
     this.cecrCoordinateWeight = Math.max(0, Math.min(1, options.cecrCoordinateWeight ?? 0.35));
     this.cecrExtremaMaxAgeMs = Math.max(1_000, options.cecrExtremaMaxAgeMs ?? 20_000);
     this.cecrMaxAcceptedDrift = Math.max(0.01, Math.min(1, options.cecrMaxAcceptedDrift ?? 0.18));
+    this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
     this.setupMeshListeners();
+    this.startCecrSyncLoop();
   }
 
   private setupMeshListeners(): void {
@@ -108,6 +135,8 @@ export class GossipProtocol {
       if (!parsed) return;
       if (parsed.type === 'direct') {
         this.handleIncomingDirect(parsed as unknown as DirectMessage, peerId);
+      } else if (parsed.type === 'cecr-state') {
+        this.handleIncomingCecrState(parsed as unknown as CecrStateMessage, peerId);
       } else {
         this.handleIncomingMessage(parsed, peerId);
       }
@@ -115,13 +144,23 @@ export class GossipProtocol {
 
     this.mesh.on('peer:connected', (peerId) => {
       this.peers.set(peerId, { connected: true, timestamp: Date.now() });
+      this.publishCecrState();
       this.emit('peerConnected', { peerId });
     });
 
     this.mesh.on('peer:disconnected', (peerId) => {
       this.peers.delete(peerId);
+      this.cecrRemoteStates.delete(peerId);
+      this.publishCecrState();
       this.emit('peerDisconnected', { peerId });
     });
+  }
+
+  private startCecrSyncLoop(): void {
+    if (this.cecrSyncTimer) return;
+    this.cecrSyncTimer = setInterval(() => {
+      this.publishCecrState();
+    }, 2_000);
   }
 
   /**
@@ -236,11 +275,14 @@ export class GossipProtocol {
     const connected = this.mesh.getConnectedPeers().filter(p => p !== exclude);
     if (connected.length === 0) return null;
     let best: string | null = null;
-    let bestDist = BigInt('0xFFFFFFFFFFFFFFFF');
+    let bestDist: bigint | null = null;
     for (const p of connected) {
       try {
         const d = this.xorDistance(p, target);
-        if (d < bestDist) { bestDist = d; best = p; }
+        if (bestDist == null || d < bestDist) {
+          bestDist = d;
+          best = p;
+        }
       } catch {
         if (!best) best = p;
       }
@@ -258,19 +300,36 @@ export class GossipProtocol {
     }
   }
 
-  private updateCecrExtremaSnapshot(): CecrExtrema | null {
+  private canonicalPeerSet(): string[] {
     const universe = new Set<string>();
     const self = this.mesh.getClientId();
     if (self) universe.add(self);
-    for (const peerId of this.mesh.getConnectedPeers()) universe.add(peerId);
     for (const peerId of this.mesh.getGlobalPeers?.() ?? []) universe.add(peerId);
+    return Array.from(universe).sort();
+  }
+
+  private canonicalSetHash(peerIds: string[]): string {
+    const input = peerIds.join('\n');
+    let hash = 0xcbf29ce484222325n;
+    const prime = 0x100000001b3n;
+    const mod = 0xFFFFFFFFFFFFFFFFn;
+    for (let i = 0; i < input.length; i++) {
+      hash ^= BigInt(input.charCodeAt(i));
+      hash = (hash * prime) & mod;
+    }
+    return hash.toString(16).padStart(16, '0');
+  }
+
+  private updateCecrExtremaSnapshot(): CecrExtrema | null {
+    const canonicalPeers = this.canonicalPeerSet();
+    const setHash = this.canonicalSetHash(canonicalPeers);
 
     let min: bigint | null = null;
     let max: bigint | null = null;
     let count = 0;
-    for (const peerId of universe) {
+    for (const peerId of canonicalPeers) {
       const value = this.peerIdToNumeric(peerId);
-      if (value == null) continue;
+      if (value == null) return null;
       if (min == null || value < min) min = value;
       if (max == null || value > max) max = value;
       count++;
@@ -285,9 +344,16 @@ export class GossipProtocol {
       max,
       updatedAtMs: Date.now(),
       size: count,
+      setHash,
     };
 
-    if (!this.cecrCurrentExtrema || this.cecrCurrentExtrema.min !== next.min || this.cecrCurrentExtrema.max !== next.max || this.cecrCurrentExtrema.size !== next.size) {
+    if (
+      !this.cecrCurrentExtrema ||
+      this.cecrCurrentExtrema.min !== next.min ||
+      this.cecrCurrentExtrema.max !== next.max ||
+      this.cecrCurrentExtrema.size !== next.size ||
+      this.cecrCurrentExtrema.setHash !== next.setHash
+    ) {
       this.cecrPreviousExtrema = this.cecrCurrentExtrema;
       this.cecrCurrentExtrema = next;
     } else {
@@ -309,6 +375,7 @@ export class GossipProtocol {
     let weight = this.cecrCoordinateWeight;
     const current = this.cecrCurrentExtrema ?? this.updateCecrExtremaSnapshot();
     if (!current) return 0;
+    if (!this.hasCecrConsensus(current)) return 0;
 
     const ageMs = Date.now() - current.updatedAtMs;
     if (ageMs > this.cecrExtremaMaxAgeMs) {
@@ -328,6 +395,78 @@ export class GossipProtocol {
     }
 
     return Math.max(0, Math.min(1, weight));
+  }
+
+  private hasCecrConsensus(local: CecrExtrema): boolean {
+    if (!this.cecrRequireConsensus) return true;
+    const now = Date.now();
+    if (now - local.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+
+    const connectedPeers = this.mesh.getConnectedPeers();
+    for (const peerId of connectedPeers) {
+      const remote = this.cecrRemoteStates.get(peerId);
+      if (!remote) return false;
+      if (now - remote.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+      if (remote.setHash !== local.setHash) return false;
+      if (remote.size !== local.size) return false;
+      if (remote.min !== local.min || remote.max !== local.max) return false;
+    }
+    return true;
+  }
+
+  private publishCecrState(): void {
+    const self = this.mesh.getClientId();
+    if (!self) return;
+    const extrema = this.updateCecrExtremaSnapshot();
+    if (!extrema) return;
+
+    const message: CecrStateMessage = {
+      id: this.generateMessageId(self),
+      type: 'cecr-state',
+      from: self,
+      timestamp: Date.now(),
+      setHash: extrema.setHash,
+      minHex: extrema.min.toString(16),
+      maxHex: extrema.max.toString(16),
+      size: extrema.size,
+    };
+
+    for (const peerId of this.mesh.getConnectedPeers()) {
+      try {
+        this.mesh.send(peerId, JSON.stringify(message));
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  private handleIncomingCecrState(message: CecrStateMessage, fromPeerId: string): void {
+    if (message.from !== fromPeerId) return;
+    if (!message.setHash || typeof message.setHash !== 'string') return;
+    if (!Number.isFinite(message.size) || message.size < 1) return;
+
+    try {
+      const min = BigInt('0x' + message.minHex);
+      const max = BigInt('0x' + message.maxHex);
+      if (min > max) return;
+      this.cecrRemoteStates.set(fromPeerId, {
+        setHash: message.setHash,
+        min,
+        max,
+        size: Math.floor(message.size),
+        updatedAtMs: Date.now(),
+      });
+    } catch {
+      // ignore malformed state
+    }
+  }
+
+  private normalizedBigIntRatio(numerator: bigint, denominator: bigint): number {
+    if (denominator <= 0n) return 1;
+    if (numerator <= 0n) return 0;
+    const scale = 1_000_000n;
+    const scaled = (numerator * scale) / denominator;
+    return Number(scaled) / Number(scale);
   }
 
   private closestPeerHybrid(target: string, exclude?: string): string | null {
@@ -362,7 +501,7 @@ export class GossipProtocol {
 
     for (const peerId of connected) {
       const dXor = xorDistances.get(peerId) ?? maxXor;
-      const xorScore = Number(dXor) / Number(maxXor || 1n);
+      const xorScore = this.normalizedBigIntRatio(dXor, maxXor || 1n);
 
       const peerCoord = this.coordinateFor(peerId, extrema);
       const ratioScore = peerCoord == null ? 1 : Math.abs(peerCoord - targetCoord);
@@ -482,6 +621,11 @@ export class GossipProtocol {
     this.messageLog.clear();
     this.peers.clear();
     this.seenDirectIds.clear();
+    this.cecrRemoteStates.clear();
+    if (this.cecrSyncTimer) {
+      clearInterval(this.cecrSyncTimer);
+      this.cecrSyncTimer = null;
+    }
     this.callbacks = {};
   }
 
@@ -497,7 +641,7 @@ export class GossipProtocol {
     }
   }
 
-  private tryParseGossipMessage(raw: any): GossipMessage | DirectMessage | null {
+  private tryParseGossipMessage(raw: any): GossipMessage | DirectMessage | CecrStateMessage | null {
     const toEnvelope = (value: any): any | null => {
       if (!value) return null;
       if (typeof value === 'object' && typeof value.id === 'string' && typeof value.type === 'string') {
@@ -533,6 +677,17 @@ export class GossipProtocol {
 
     if (parsed.type === 'direct' && typeof parsed.from === 'string' && typeof parsed.to === 'string') {
       return parsed as DirectMessage;
+    }
+
+    if (
+      parsed.type === 'cecr-state' &&
+      typeof parsed.from === 'string' &&
+      typeof parsed.setHash === 'string' &&
+      typeof parsed.minHex === 'string' &&
+      typeof parsed.maxHex === 'string' &&
+      typeof parsed.size === 'number'
+    ) {
+      return parsed as CecrStateMessage;
     }
 
     return null;
