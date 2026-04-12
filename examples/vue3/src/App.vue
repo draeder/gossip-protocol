@@ -176,6 +176,44 @@
           </button>
         </div>
       </section>
+
+      <!-- Direct Messages -->
+      <section class="chat dm-section" v-if="isRunning">
+        <h3>📩 Direct Message</h3>
+        <div class="dm-input-row">
+          <select v-model="dmTarget" class="input dm-select" data-testid="dm-target">
+            <option value="" disabled>{{ globalPeersList.length ? 'Select peer…' : 'Waiting for peers…' }}</option>
+            <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0,8) }}…</option>
+          </select>
+          <input
+            v-model="dmInput"
+            @keyup.enter="sendDm"
+            :disabled="!dmTarget"
+            placeholder="Private message…"
+            class="input dm-text"
+            data-testid="dm-input"
+          />
+          <button
+            @click="sendDm"
+            :disabled="!dmTarget || !dmInput.trim()"
+            class="btn btn-dm"
+            data-testid="dm-send"
+          >
+            Send DM
+          </button>
+        </div>
+        <div ref="dmLogContainer" class="log-container chat-container dm-log">
+          <div v-for="(entry, idx) in dmMessages" :key="idx" class="log-entry">
+            <div class="bubble" :class="entry.local ? 'dm-me' : 'dm-peer'">
+              <div class="bubble-meta">
+                <span class="sender">{{ entry.local ? `You → ${entry.to.slice(0,6)}` : `${entry.from.slice(0,6)} → You` }}</span>
+                <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
+              </div>
+              <div class="bubble-text">{{ entry.text }}</div>
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 </template>
@@ -193,9 +231,13 @@ export default {
       isRunning: false,
       isConnecting: false,
       messageInput: '',
+      dmInput: '',
+      dmTarget: '',
       clientId: '',
       connectedPeersList: [],
       discoveredPeersList: [],
+      globalPeersList: [],
+      dmLog: [],
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 2,
@@ -208,13 +250,14 @@ export default {
         title: '',
         message: '',
         type: 'info'
-      }
+      },
+      uiStateKey: 'gossip-protocol:ui-state'
     };
   },
   mounted() {
     const params = new URLSearchParams(window.location.search);
 
-    // Use a browser-local room by default to avoid collisions on the public signaling service.
+    // Use a browser-local room by default to keep tabs in the same network.
     const storageKey = 'gossip-protocol:room-session-id';
     const ensureLocalRoomSessionId = () => {
       try {
@@ -267,6 +310,8 @@ export default {
     if (autostart === '1' || autostart === 'true' || autostart === 'yes') {
       this.startMesh();
     }
+
+    this.loadUiState();
   },
   computed: {
     effectiveSessionId() {
@@ -284,6 +329,9 @@ export default {
     },
     chatMessages() {
       return this.messageLog.filter(e => e.type === 'sent' || e.type === 'received');
+    },
+    dmMessages() {
+      return this.dmLog;
     }
   },
   watch: {
@@ -357,6 +405,10 @@ export default {
           this.updateStats();
         });
 
+        this.mesh.on('mesh:membership', () => {
+          this.updateStats();
+        });
+
         this.mesh.on('mesh:ready', () => {
           this.addLog('info', 'Gossip reached ready state', 'System');
         });
@@ -379,6 +431,18 @@ export default {
 
         this.mesh.on('signaling:error', (error) => {
           this.showStatus('Error', `${error.message || error}`, 'error');
+        });
+
+        this.gossip.on('directMessageReceived', ({ message }) => {
+          this.dmLog.push({
+            local: false,
+            from: message.from,
+            to: message.to,
+            text: String(message.data),
+            timestamp: new Date(message.timestamp),
+          });
+          this.saveUiState();
+          this.$nextTick(() => this.scrollDmToBottom());
         });
 
         await this.mesh.init();
@@ -411,6 +475,11 @@ export default {
       }
       this.isRunning = false;
       this.messageLog = [];
+      this.dmLog = [];
+      this.dmTarget = '';
+      this.dmInput = '';
+      this.globalPeersList = [];
+      this.saveUiState();
       this.addLog('info', 'Mesh stopped', 'System');
       this.showStatus('Idle', 'Idle', 'info');
     },
@@ -428,10 +497,56 @@ export default {
       if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
     },
 
+    sendDm() {
+      if (!this.gossip || !this.dmInput.trim()) return;
+      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const target = String(this.dmTarget || '').trim();
+      if (!target || (self && target === self)) {
+        this.addLog('info', 'Select a valid peer target for DM', 'System');
+        return;
+      }
+
+      const text = this.dmInput.trim();
+      this.dmInput = '';
+      const id = this.gossip.sendDirect(target, text);
+      if (!id) {
+        this.addLog('info', 'DM failed: local peer ID is not ready yet', 'System');
+        return;
+      }
+      this.dmLog.push({
+        local: true,
+        from: self || this.clientId,
+        to: target,
+        text,
+        timestamp: new Date(),
+      });
+      this.saveUiState();
+      this.$nextTick(() => this.scrollDmToBottom());
+    },
+
     updateStats() {
       if (this.mesh) {
+        const meshClientId = String(this.mesh.getClientId?.() || this.clientId || '').trim();
+        if (meshClientId) {
+          this.clientId = meshClientId;
+        }
+
         this.connectedPeersList = this.mesh.getConnectedPeers();
         this.discoveredPeersList = this.mesh.getDiscoveredPeers();
+        const global = this.mesh.getGlobalPeers ? this.mesh.getGlobalPeers() : [];
+        const self = meshClientId;
+        this.globalPeersList = [...new Set([
+          ...global,
+          ...this.connectedPeersList,
+          ...this.discoveredPeersList,
+        ])].filter(p => p && p !== self);
+
+        // Keep DM target valid as the membership view converges.
+        if (!this.globalPeersList.includes(this.dmTarget) || this.dmTarget === self) {
+          this.dmTarget = this.globalPeersList[0] || '';
+        }
+
+        this.saveUiState();
       }
 
       this.syncGossipStatus();
@@ -486,7 +601,40 @@ export default {
       const container = this.$refs.logContainer;
       if (!container) return;
       container.scrollTop = container.scrollHeight;
-    }
+    },
+
+    scrollDmToBottom() {
+      const container = this.$refs.dmLogContainer;
+      if (!container) return;
+      container.scrollTop = container.scrollHeight;
+    },
+
+    saveUiState() {
+      try {
+        sessionStorage.setItem(this.uiStateKey, JSON.stringify({
+          dmTarget: this.dmTarget || '',
+          dmLog: this.dmLog.slice(-100)
+        }));
+      } catch {
+        // ignore storage failures
+      }
+    },
+
+    loadUiState() {
+      try {
+        const raw = sessionStorage.getItem(this.uiStateKey);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed.dmLog)) {
+          this.dmLog = parsed.dmLog;
+        }
+        if (typeof parsed.dmTarget === 'string') {
+          this.dmTarget = parsed.dmTarget;
+        }
+      } catch {
+        // ignore storage failures
+      }
+    },
   },
 
   beforeUnmount() {
@@ -881,6 +1029,74 @@ section {
   color: #1e3a8a !important;
   border-bottom-left-radius: 4px;
   border: 1px solid #bfdbfe;
+}
+
+.bubble.dm-me {
+  margin-left: auto;
+  background: #4f46e5 !important;
+  color: #fff !important;
+  border-bottom-right-radius: 4px;
+  border: 1px solid #3730a3;
+}
+
+.bubble.dm-peer {
+  margin-right: auto;
+  background: #fdf4ff !important;
+  color: #6b21a8 !important;
+  border-bottom-left-radius: 4px;
+  border: 1px solid #e9d5ff;
+}
+
+.dm-section {
+  border-top: 3px solid #e9d5ff;
+}
+
+.dm-input-row {
+  display: flex;
+  gap: 0.75rem;
+  width: 100%;
+  align-items: stretch;
+  margin-bottom: 0.75rem;
+}
+
+.dm-select {
+  flex: 0 0 160px;
+  cursor: pointer;
+}
+
+.dm-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-dm {
+  flex: 0 0 120px;
+  background: linear-gradient(135deg, #7c3aed 0%, #4f46e5 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0.75rem 1rem;
+  transition: all 0.3s;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn-dm:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
+}
+
+.btn-dm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dm-log {
+  height: 180px;
+  max-height: 30vh;
 }
 
 /* Ensure the chat section itself clips any inner overflow */

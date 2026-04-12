@@ -77,6 +77,7 @@ export type PartialMeshEvents = {
   'peer:error': (data: { peerId: string; error: any }) => void;
   'peer:discovered': (peerId: string) => void;
   'mesh:ready': () => void;
+  'mesh:membership': (peers: string[]) => void;
 };
 
 /**
@@ -97,6 +98,8 @@ export class PartialMesh {
   private underConnectedSinceMs: number | null = null;
   private lastHardResetAtMs: number = 0;
   private lastDiscoveryRefreshAtMs: number = 0;
+  /** Converged global peer membership — populated via in-band membership gossip. */
+  private globalPeers: Set<string> = new Set();
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
@@ -123,7 +126,8 @@ export class PartialMesh {
       'peer:data',
       'peer:error',
       'peer:discovered',
-      'mesh:ready'
+      'mesh:ready',
+      'mesh:membership'
     ];
     events.forEach(event => this.eventHandlers.set(event, new Set()));
   }
@@ -228,6 +232,9 @@ export class PartialMesh {
       if (this.getConnectedPeers().length >= this.config.minPeers) {
         this.emit('mesh:ready');
       }
+
+      // Announce our current global peer knowledge to the new peer
+      this.sendMembership(peerId);
     });
 
     this.signalingClient.on('rtc:disconnected', (data: { peerId: string }) => {
@@ -251,7 +258,12 @@ export class PartialMesh {
     });
 
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
-      this.emit('peer:data', data);
+      const msg = this.tryParseMembership(data.data);
+      if (msg) {
+        this.mergeMembership(msg.peers, data.peerId);
+      } else {
+        this.emit('peer:data', data);
+      }
     });
 
     this.signalingClient.on('error', (error: any) => {
@@ -611,6 +623,13 @@ export class PartialMesh {
   }
 
   /**
+   * Get the converged global peer set (all peers known via membership gossip).
+   */
+  public getGlobalPeers(): string[] {
+    return Array.from(this.globalPeers);
+  }
+
+  /**
    * Get current peer count
    */
   public getPeerCount(): number {
@@ -658,7 +677,62 @@ export class PartialMesh {
         }
       });
     }
+
   }
+    // ─── Membership gossip ────────────────────────────────────────────────────
+
+    private sendMembership(toPeerId: string): void {
+      const self = this.normalizePeerId(this.clientId);
+      const all = new Set<string>(this.globalPeers);
+      if (self) all.add(self);
+      for (const p of this.discoveredPeers) all.add(p);
+      const payload = JSON.stringify({ __membership: true, peers: Array.from(all) });
+      try {
+        this.signalingClient?.send(toPeerId, payload);
+      } catch {
+        // best-effort
+      }
+    }
+
+    private tryParseMembership(raw: any): { peers: string[] } | null {
+      try {
+        const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (obj?.__membership === true && Array.isArray(obj.peers)) {
+          return { peers: obj.peers };
+        }
+      } catch {
+        // not a membership message
+      }
+      return null;
+    }
+
+    private mergeMembership(incoming: string[], fromPeerId: string): void {
+      const self = this.normalizePeerId(this.clientId);
+      let changed = false;
+      for (const raw of incoming) {
+        const id = this.normalizePeerId(raw);
+        if (!id || id === self) continue;
+        if (!this.globalPeers.has(id)) {
+          this.globalPeers.add(id);
+          changed = true;
+          if (!this.discoveredPeers.has(id)) {
+            this.discoveredPeers.add(id);
+            this.emit('peer:discovered', id);
+          }
+        }
+      }
+      if (changed) {
+        this.emit('mesh:membership', Array.from(this.globalPeers));
+        for (const peerId of this.getConnectedPeers()) {
+          if (peerId !== fromPeerId) {
+            this.sendMembership(peerId);
+          }
+        }
+        if (this.config.autoConnect) {
+          this.maintainPeerConnections();
+        }
+      }
+    }
 
   /**
    * Disconnect from all peers and close signaling connection
