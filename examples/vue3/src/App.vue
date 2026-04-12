@@ -8,6 +8,71 @@
     <main>
       <!-- Control Panel -->
       <section class="control-panel">
+        <div class="config-grid">
+          <label class="field">
+            <span class="field-label">Server</span>
+            <input
+              v-model.trim="signalingServer"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="signaling-server"
+              placeholder="wss://peer.ooo/ws"
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Network Name</span>
+            <input
+              v-model.trim="networkName"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="network-name"
+              placeholder="gossip"
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Room / Session ID</span>
+            <input
+              v-model.trim="roomSessionId"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="room-session-id"
+              placeholder="my-room"
+            />
+          </label>
+
+          <label class="field field-number">
+            <span class="field-label">Min Peers</span>
+            <input
+              v-model.number="minPeers"
+              type="number"
+              min="1"
+              max="50"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="min-peers"
+            />
+          </label>
+
+          <label class="field field-number">
+            <span class="field-label">Max Peers</span>
+            <input
+              v-model.number="maxPeers"
+              type="number"
+              min="1"
+              max="50"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="max-peers"
+            />
+          </label>
+        </div>
+
+        <p class="effective-session">
+          Effective Session: <span class="mono">{{ effectiveSessionId }}</span>
+        </p>
+
         <div class="button-group">
           <button 
             @click="startMesh" 
@@ -25,6 +90,10 @@
           >
             Stop Mesh
           </button>
+        </div>
+
+        <div class="status-field" :class="`status-${status.type}`" data-testid="status-message">
+          {{ status.message || 'Idle' }}
         </div>
       </section>
 
@@ -46,12 +115,6 @@
           <span class="label">Messages Seen:</span>
           <span class="value" data-testid="messages-seen">{{ messagesSeen }}</span>
         </div>
-      </section>
-
-      <!-- Status Box -->
-      <section v-if="status.show" :class="['status-box', status.type]">
-        <h3>{{ status.title }}</h3>
-        <p>{{ status.message }}</p>
       </section>
 
       <!-- Peer Network Visualization -->
@@ -135,13 +198,13 @@ export default {
       discoveredPeersList: [],
       messagesSeen: 0,
       maxPeers: 5,
-      minPeers: 1,
-      sessionId: '',
+      minPeers: 2,
+      networkName: 'gossip',
+      roomSessionId: '',
       signalingServer: 'wss://peer.ooo/ws',
       messageLog: [],
       autoScroll: true,
       status: {
-        show: false,
         title: '',
         message: '',
         type: 'info'
@@ -152,8 +215,8 @@ export default {
     const params = new URLSearchParams(window.location.search);
 
     // Use a browser-local room by default to avoid collisions on the public signaling service.
-    const storageKey = 'gossip-protocol:session-id';
-    const ensureLocalSessionId = () => {
+    const storageKey = 'gossip-protocol:room-session-id';
+    const ensureLocalRoomSessionId = () => {
       try {
         const existing = localStorage.getItem(storageKey);
         if (existing && existing.trim()) return existing.trim();
@@ -164,7 +227,7 @@ export default {
         return `gp-${Math.random().toString(36).slice(2, 10)}`;
       }
     };
-    this.sessionId = ensureLocalSessionId();
+    this.roomSessionId = ensureLocalRoomSessionId();
 
     const maxPeersParam = Number(params.get('maxPeers'));
     if (Number.isFinite(maxPeersParam) && maxPeersParam >= 1) {
@@ -180,9 +243,19 @@ export default {
       this.minPeers = this.maxPeers;
     }
 
+    const networkNameParam = params.get('networkName') || params.get('network');
+    if (networkNameParam) {
+      this.networkName = networkNameParam;
+    }
+
     const sessionIdParam = params.get('sessionId');
     if (sessionIdParam) {
-      this.sessionId = sessionIdParam;
+      this.roomSessionId = sessionIdParam;
+    }
+
+    const roomSessionIdParam = params.get('roomSessionId') || params.get('room');
+    if (roomSessionIdParam) {
+      this.roomSessionId = roomSessionIdParam;
     }
 
     const signalingServerParam = params.get('signalingServer') || params.get('signalUrl');
@@ -196,6 +269,13 @@ export default {
     }
   },
   computed: {
+    effectiveSessionId() {
+      const network = String(this.networkName || '').trim();
+      const room = String(this.roomSessionId || '').trim();
+
+      if (network && room) return `${network}:${room}`;
+      return network || room || 'default';
+    },
     connectedPeers() {
       return this.connectedPeersList.length;
     },
@@ -218,12 +298,29 @@ export default {
   methods: {
     async startMesh() {
       try {
+        const normalizedMin = Math.max(1, Math.min(50, Number(this.minPeers) || 1));
+        const normalizedMax = Math.max(1, Math.min(50, Number(this.maxPeers) || 1));
+        this.minPeers = Math.min(normalizedMin, normalizedMax);
+        this.maxPeers = Math.max(normalizedMin, normalizedMax);
+        this.networkName = String(this.networkName || '').trim();
+        this.roomSessionId = String(this.roomSessionId || '').trim();
+        this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
+
+        try {
+          localStorage.setItem('gossip-protocol:room-session-id', this.roomSessionId || `gp-${Math.random().toString(36).slice(2, 10)}`);
+          if (!this.roomSessionId) {
+            this.roomSessionId = localStorage.getItem('gossip-protocol:room-session-id') || '';
+          }
+        } catch {
+          // ignore storage errors
+        }
+
         this.isConnecting = true;
         this.showStatus('Connecting...', 'Initializing PartialMesh with Gossip Protocol...', 'connecting');
 
         this.mesh = new PartialMesh({
           signalingServer: this.signalingServer,
-          sessionId: this.sessionId,
+          sessionId: this.effectiveSessionId,
           minPeers: this.minPeers,
           maxPeers: this.maxPeers,
           autoDiscover: true,
@@ -253,7 +350,6 @@ export default {
         this.mesh.on('peer:connected', (peerId) => {
           this.addLog('connected', `Connected to peer`, peerId);
           this.updateStats();
-          this.showStatus('Peer Connected', `Connected to ${peerId.slice(0, 6)}...`, 'success');
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
@@ -262,7 +358,8 @@ export default {
         });
 
         this.mesh.on('mesh:ready', () => {
-          this.showStatus('Mesh Ready! 🎉', 'Minimum peers connected. Gossip protocol is active!', 'success');
+          this.addLog('info', 'Gossip reached ready state', 'System');
+          this.showStatus('Ready', 'Gossip OK', 'success');
         });
 
         // Gossip events
@@ -316,6 +413,7 @@ export default {
       this.isRunning = false;
       this.messageLog = [];
       this.addLog('info', 'Mesh stopped', 'System');
+      this.showStatus('Idle', 'Idle', 'info');
     },
 
     sendMessage() {
@@ -359,12 +457,7 @@ export default {
     },
 
     showStatus(title, message, type = 'info') {
-      this.status = { show: true, title, message, type };
-      if (type !== 'error') {
-        setTimeout(() => {
-          this.status.show = false;
-        }, 5000);
-      }
+      this.status = { title, message, type };
     },
 
     formatTime(date) {
@@ -438,6 +531,41 @@ section {
   gap: 1rem;
 }
 
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.85rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.field-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #4a4a4a;
+}
+
+.field-number .input {
+  text-align: center;
+}
+
+.effective-session {
+  color: #4a4a4a;
+  font-size: 0.9rem;
+}
+
+.effective-session .mono {
+  font-family: 'Monaco', 'Courier New', monospace;
+  font-weight: 700;
+  color: #3f51b5;
+}
+
 .button-group {
   display: flex;
   gap: 1rem;
@@ -447,15 +575,25 @@ section {
 .message-input {
   display: flex;
   gap: 1rem;
+  width: 100%;
+  align-items: stretch;
 }
 
 .input {
-  flex: 1;
   padding: 0.75rem 1rem;
   border: 2px solid #e0e0e0;
   border-radius: 8px;
   font-size: 1rem;
   transition: border-color 0.3s;
+}
+
+.message-input .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.message-input .btn {
+  flex: 0 0 120px;
 }
 
 .input:focus {
@@ -544,35 +682,35 @@ section {
   word-break: break-all;
 }
 
-/* Status Box */
-.status-box {
-  border-radius: 12px;
-  padding: 1.5rem;
-  margin-bottom: 1rem;
-  border-left: 4px solid;
+/* Inline status field */
+.status-field {
+  border: 1px solid #d6d9de;
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.92rem;
+  color: #3e4a59;
+  background: #f8fafc;
+  min-height: 2.2rem;
+  display: flex;
+  align-items: center;
 }
 
-.status-box.connecting {
-  background: #e3f2fd;
-  border-left-color: #2196f3;
-  color: #1976d2;
+.status-field.status-connecting {
+  color: #0f4c81;
+  background: #edf5ff;
+  border-color: #c6dfff;
 }
 
-.status-box.success {
-  background: #e8f5e9;
-  border-left-color: #4caf50;
-  color: #2e7d32;
+.status-field.status-success {
+  color: #165b3d;
+  background: #effaf3;
+  border-color: #bfe6cd;
 }
 
-.status-box.error {
-  background: #ffebee;
-  border-left-color: #f44336;
-  color: #c62828;
-}
-
-.status-box h3 {
-  margin-bottom: 0.5rem;
-  font-size: 1.2rem;
+.status-field.status-error {
+  color: #8b1d1d;
+  background: #fff1f1;
+  border-color: #f1c3c3;
 }
 
 /* Network Visualization */
