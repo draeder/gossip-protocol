@@ -136,7 +136,8 @@ export default {
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 1,
-      sessionId: 'gossip-protocol-demo',
+      sessionId: '',
+      signalingServer: 'wss://peer.ooo/ws',
       messageLog: [],
       autoScroll: true,
       status: {
@@ -149,6 +150,21 @@ export default {
   },
   mounted() {
     const params = new URLSearchParams(window.location.search);
+
+    // Use a browser-local room by default to avoid collisions on the public signaling service.
+    const storageKey = 'gossip-protocol:session-id';
+    const ensureLocalSessionId = () => {
+      try {
+        const existing = localStorage.getItem(storageKey);
+        if (existing && existing.trim()) return existing.trim();
+        const generated = `gp-${Math.random().toString(36).slice(2, 10)}`;
+        localStorage.setItem(storageKey, generated);
+        return generated;
+      } catch {
+        return `gp-${Math.random().toString(36).slice(2, 10)}`;
+      }
+    };
+    this.sessionId = ensureLocalSessionId();
 
     const maxPeersParam = Number(params.get('maxPeers'));
     if (Number.isFinite(maxPeersParam) && maxPeersParam >= 1) {
@@ -167,6 +183,11 @@ export default {
     const sessionIdParam = params.get('sessionId');
     if (sessionIdParam) {
       this.sessionId = sessionIdParam;
+    }
+
+    const signalingServerParam = params.get('signalingServer') || params.get('signalUrl');
+    if (signalingServerParam) {
+      this.signalingServer = signalingServerParam;
     }
 
     const autostart = (params.get('autostart') || '').toLowerCase();
@@ -201,7 +222,7 @@ export default {
         this.showStatus('Connecting...', 'Initializing PartialMesh with Gossip Protocol...', 'connecting');
 
         this.mesh = new PartialMesh({
-          signalingServer: 'wss://peer.ooo/ws',
+          signalingServer: this.signalingServer,
           sessionId: this.sessionId,
           minPeers: this.minPeers,
           maxPeers: this.maxPeers,
@@ -213,6 +234,9 @@ export default {
         });
 
         this.gossip = new GossipProtocol(this.mesh);
+        // Runtime inspection hook for debugging in dev tools / automation.
+        window.__mesh = this.mesh;
+        window.__gossip = this.gossip;
 
         // Mesh events
         this.mesh.on('signaling:connected', (data) => {
@@ -265,9 +289,17 @@ export default {
         this.isRunning = true;
         this.isConnecting = false;
         this.updateStats();
+
+        // Best-effort warning only; do not hard-fail startup on transient signaling slowness.
+        setTimeout(() => {
+          if (this.isRunning && !this.clientId) {
+            this.showStatus('Connecting...', `Still waiting on signaling server (${this.signalingServer})`, 'connecting');
+          }
+        }, 12_000);
       } catch (error) {
         console.error('Failed to start mesh:', error);
-        this.showStatus('Error', error.message, 'error');
+        this.showStatus('Error', error.message || String(error), 'error');
+        this.isRunning = false;
         this.isConnecting = false;
       }
     },

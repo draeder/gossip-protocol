@@ -34,9 +34,10 @@ export interface PartialMeshConfig {
   // Intentionally minimal config surface.
   
   /**
-   * ICE servers configuration for STUN/TURN
+   * ICE servers configuration for STUN/TURN.
+   * Set to null to use FreeRTC defaults.
    */
-  iceServers?: RTCIceServer[];
+  iceServers?: RTCIceServer[] | null;
 
   /**
    * How long to wait for a peer connection to reach 'connect' before retrying.
@@ -95,6 +96,7 @@ export class PartialMesh {
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   private underConnectedSinceMs: number | null = null;
   private lastHardResetAtMs: number = 0;
+  private lastDiscoveryRefreshAtMs: number = 0;
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
@@ -104,9 +106,8 @@ export class PartialMesh {
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
-      iceServers: config.iceServers ?? [
-        { urls: 'stun:stun.l.google.com:19302' }
-      ],
+      // Prefer FreeRTC's richer built-in ICE profile by default.
+      iceServers: config.iceServers ?? null,
       connectionTimeoutMs: config.connectionTimeoutMs ?? 25_000,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0
@@ -267,12 +268,32 @@ export class PartialMesh {
 
     this.maintenanceTimer = setInterval(() => {
       try {
+        this.maybeRefreshDiscovery();
         this.maintainPeerConnections();
         this.maybeHardResetUnderConnected();
       } catch {
         // ignore
       }
     }, this.config.maintenanceIntervalMs);
+  }
+
+  private maybeRefreshDiscovery(): void {
+    if (!this.config.autoDiscover) return;
+
+    const connected = this.getConnectedPeers().length;
+    const now = Date.now();
+    const underConnected = connected < this.config.minPeers;
+    const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
+
+    if (!underConnected && !hasFewCandidates) return;
+    if (now - this.lastDiscoveryRefreshAtMs < 2_000) return;
+
+    this.lastDiscoveryRefreshAtMs = now;
+    try {
+      this.signalingClient?.joinSession(this.config.sessionId);
+    } catch {
+      // ignore
+    }
   }
 
   private maybeHardResetUnderConnected(): void {
@@ -390,6 +411,29 @@ export class PartialMesh {
         this.emit('peer:error', { peerId, error: err });
         this.removePeer(peerId);
       });
+    } else {
+      // Discovery can be one-sided for a while: the newly joined peer often sees the
+      // existing peer first, while the existing peer is not notified immediately.
+      // If no inbound WebRTC state appears after a short grace period, fall back to
+      // initiating from this side to avoid waiting indefinitely.
+      setTimeout(() => {
+        const current = this.peers.get(peerId);
+        if (!current || current.connected || !this.connecting.has(peerId)) return;
+
+        const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peerId);
+        if (rtcEntry) return;
+
+        this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err: any) => {
+          this.connecting.delete(peerId);
+          const t = this.connectionTimers.get(peerId);
+          if (t) {
+            clearTimeout(t);
+            this.connectionTimers.delete(peerId);
+          }
+          this.emit('peer:error', { peerId, error: err });
+          this.removePeer(peerId);
+        });
+      }, 7_000);
     }
     // Non-initiator: FreeRTC handles the incoming offer entirely on its own.
     // We'll receive an rtc:connected event when the data channel opens.
@@ -404,15 +448,12 @@ export class PartialMesh {
     const currentPeerCount = this.peers.size;
     const connectingCount = this.connecting.size;
     const totalInProgress = currentPeerCount + connectingCount;
+    const available = Array.from(this.discoveredPeers).filter(
+      peerId => !this.peers.has(peerId) && !this.connecting.has(peerId)
+    );
 
-    if (totalInProgress < this.config.minPeers) {
-      // Need more connections
-      const needed = this.config.minPeers - totalInProgress;
-      const available = Array.from(this.discoveredPeers).filter(
-        peerId => !this.peers.has(peerId) && !this.connecting.has(peerId)
-      );
-
-      if (available.length === 0) return;
+    const pickCandidates = (count: number): string[] => {
+      if (available.length === 0 || count <= 0) return [];
 
       // Avoid all peers picking the same "first" discovered peer by rotating the list.
       // This reduces thundering-herd behavior and improves overall convergence.
@@ -427,8 +468,23 @@ export class PartialMesh {
         offset = sorted.length ? hash % sorted.length : 0;
       }
 
-      for (let i = 0; i < Math.min(needed, sorted.length); i++) {
-        const peerId = sorted[(offset + i) % sorted.length];
+      const selected: string[] = [];
+      for (let i = 0; i < Math.min(count, sorted.length); i++) {
+        selected.push(sorted[(offset + i) % sorted.length]);
+      }
+      return selected;
+    };
+
+    if (totalInProgress < this.config.minPeers) {
+      // Need more connections
+      const needed = this.config.minPeers - totalInProgress;
+      for (const peerId of pickCandidates(needed)) {
+        this.connectToPeer(peerId);
+      }
+    } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
+      // Once the mesh is minimally healthy, keep adding a small number of bridge links.
+      // This helps later-joining peers connect across sub-clusters instead of staying siloed.
+      for (const peerId of pickCandidates(1)) {
         this.connectToPeer(peerId);
       }
     } else if (currentPeerCount > this.config.maxPeers) {
@@ -448,6 +504,11 @@ export class PartialMesh {
   public connectToPeer(peerId: string): void {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
+    if (!selfId) {
+      // Wait until signaling has provided a stable local ID; dialing before this
+      // can make both sides choose initiator and deadlock in offer glare.
+      return;
+    }
     if (!normalizedPeerId ||
         this.peers.has(normalizedPeerId) || 
         this.connecting.has(normalizedPeerId) || 
@@ -460,9 +521,12 @@ export class PartialMesh {
       return;
     }
 
-    // Deterministic initiator selection prevents both sides from creating offers.
-    // If clientId isn't known yet (should be rare here), default to initiating.
-    const initiator = selfId ? selfId < normalizedPeerId : true;
+    // Discovery can be asymmetric (one side sees the other first).
+    // Always dialing here prevents deadlock where neither side initiates.
+    // Use deterministic role selection to prevent SDP glare.
+    // When both peers discover each other simultaneously, only the one with the
+    // lexicographically smaller ID sends an offer; the other waits for the inbound offer.
+    const initiator = selfId < normalizedPeerId;
 
     this.connecting.add(normalizedPeerId);
     this.createPeerConnection(normalizedPeerId, initiator);
@@ -624,6 +688,7 @@ export class PartialMesh {
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
+    this.lastDiscoveryRefreshAtMs = 0;
 
     // Disconnect from signaling server
     if (this.signalingClient) {
