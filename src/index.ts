@@ -98,6 +98,8 @@ export class PartialMesh {
   private underConnectedSinceMs: number | null = null;
   private lastHardResetAtMs: number = 0;
   private lastDiscoveryRefreshAtMs: number = 0;
+  private dialFailureCount: Map<string, number> = new Map();
+  private dialBackoffUntilMs: Map<string, number> = new Map();
   /** Converged global peer membership — populated via in-band membership gossip. */
   private globalPeers: Set<string> = new Set();
 
@@ -204,6 +206,8 @@ export class PartialMesh {
       if (!peerId) return;
       this.removeFromGlobalMembership(peerId);
       this.discoveredPeers.delete(peerId);
+      this.dialFailureCount.delete(peerId);
+      this.dialBackoffUntilMs.delete(peerId);
       this.removePeer(peerId, true);
     });
 
@@ -224,6 +228,7 @@ export class PartialMesh {
       }
       peerConnection.connected = true;
       this.connecting.delete(peerId);
+      this.noteDialSuccess(peerId);
       this.emit('peer:connected', peerId);
 
       if (this.config.autoConnect) {
@@ -336,6 +341,23 @@ export class PartialMesh {
     this.hardReset('under-connected');
   }
 
+  private isPeerBackedOff(peerId: string): boolean {
+    const until = this.dialBackoffUntilMs.get(peerId) ?? 0;
+    return until > Date.now();
+  }
+
+  private noteDialFailure(peerId: string): void {
+    const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
+    this.dialFailureCount.set(peerId, failures);
+    const backoffMs = Math.min(30_000, 1_000 * Math.pow(2, Math.min(failures, 5)));
+    this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
+  }
+
+  private noteDialSuccess(peerId: string): void {
+    this.dialFailureCount.delete(peerId);
+    this.dialBackoffUntilMs.delete(peerId);
+  }
+
   /**
    * Hard reset peer connections (keeps signaling + discovered peers).
    * Useful for recovering from rare stuck negotiation/ICE states.
@@ -405,6 +427,7 @@ export class PartialMesh {
       if (!current || current.connected) return;
 
       this.connecting.delete(peerId);
+      this.noteDialFailure(peerId);
       this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
       this.removePeer(peerId);
     }, this.config.connectionTimeoutMs);
@@ -416,6 +439,7 @@ export class PartialMesh {
       // FreeRTC handles the full offer/answer/ICE exchange internally.
       this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err: any) => {
         this.connecting.delete(peerId);
+        this.noteDialFailure(peerId);
         const t = this.connectionTimers.get(peerId);
         if (t) {
           clearTimeout(t);
@@ -438,6 +462,7 @@ export class PartialMesh {
 
         this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err: any) => {
           this.connecting.delete(peerId);
+          this.noteDialFailure(peerId);
           const t = this.connectionTimers.get(peerId);
           if (t) {
             clearTimeout(t);
@@ -461,17 +486,24 @@ export class PartialMesh {
     const currentPeerCount = this.peers.size;
     const connectingCount = this.connecting.size;
     const totalInProgress = currentPeerCount + connectingCount;
-    const available = Array.from(this.discoveredPeers).filter(
+    const allCandidates = Array.from(this.discoveredPeers).filter(
       peerId => !this.peers.has(peerId) && !this.connecting.has(peerId)
     );
+    const available = allCandidates.filter(peerId => !this.isPeerBackedOff(peerId));
 
     const pickCandidates = (count: number): string[] => {
-      if (available.length === 0 || count <= 0) return [];
+      if ((available.length === 0 && allCandidates.length === 0) || count <= 0) return [];
 
       // Avoid all peers picking the same "first" discovered peer by rotating the list.
       // This reduces thundering-herd behavior and improves overall convergence.
       const selfId = this.normalizePeerId(this.clientId);
-      const sorted = available.slice().sort();
+      const source = available.length > 0 ? available : allCandidates;
+      const sorted = source.slice().sort((a, b) => {
+        const failA = this.dialFailureCount.get(a) ?? 0;
+        const failB = this.dialFailureCount.get(b) ?? 0;
+        if (failA !== failB) return failA - failB;
+        return a.localeCompare(b);
+      });
       let offset = 0;
       if (selfId) {
         let hash = 0;
@@ -526,6 +558,10 @@ export class PartialMesh {
         this.peers.has(normalizedPeerId) || 
         this.connecting.has(normalizedPeerId) || 
         normalizedPeerId === selfId) {
+      return;
+    }
+
+    if (this.isPeerBackedOff(normalizedPeerId)) {
       return;
     }
 
@@ -775,6 +811,8 @@ export class PartialMesh {
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
+    this.dialFailureCount.clear();
+    this.dialBackoffUntilMs.clear();
 
     // Disconnect from signaling server
     if (this.signalingClient) {

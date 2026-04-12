@@ -30,5 +30,12 @@ export default defineConfig({
   },
   optimizeDeps: {
     include: ['events', 'util', 'stream-browserify', 'buffer', 'process']
+  },
+  server: {
+    headers: {
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    }
   }
 })

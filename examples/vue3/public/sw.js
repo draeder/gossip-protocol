@@ -1,19 +1,25 @@
 /* Minimal service worker for the Vue3 demo.
  *
- * Intentionally does not cache or intercept requests beyond a pass-through fetch.
- * Its purpose is to ensure one SW is registered per browser context/engine.
+ * Clears all caches on activate so Safari and other browsers never serve
+ * stale JS/CSS after a redeploy. Falls back to a network-only fetch strategy.
  */
 
 self.addEventListener('install', (event) => {
-  // Activate immediately on install.
+  // Skip waiting so this SW activates immediately, replacing any old version.
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.map((key) => caches.delete(key)))
+    ).then(() => self.clients.claim())
+  );
 });
 
 self.addEventListener('fetch', (event) => {
-  // Pass-through; do not cache.
-  event.respondWith(fetch(event.request));
+  // Network-only: never serve from cache.
+  event.respondWith(
+    fetch(event.request, { cache: 'no-store' }).catch(() => fetch(event.request))
+  );
 });
