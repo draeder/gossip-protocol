@@ -15,12 +15,14 @@ Research note:
 What is implemented today:
 
 - In-band membership gossip so peers gradually converge on a larger shared peer set than their immediate connections.
+- Symmetric membership removal on signaling `peer-left` events.
 - Gossip broadcast with adaptive fan-out based on estimated network size.
 - Hybrid direct routing that combines coordinate-space proximity with XOR distance, with bounded-drift fallback behavior.
 
 What is not implemented today:
 
 - Formal proofs/analysis tooling for CECR stability bounds under arbitrary churn.
+- A canonical globally synchronized membership digest/hash.
 
 ## Install
 
@@ -140,7 +142,7 @@ Behavior:
 
 - Broadcast fan-out scales with estimated network size using $\max(2, \lceil \log_2(N+1) \rceil)$.
 - Broadcast max hops is also scaled upward based on estimated network size.
-- Direct messages use hybrid CECR next-hop selection: coordinate-space proximity (from converged global extrema) plus XOR distance.
+- Direct messages use hybrid CECR next-hop selection: coordinate-space proximity (from each node's local extrema snapshot) plus XOR distance.
 - Under stale/extrema-shift conditions, coordinate weighting is reduced so routing falls back toward XOR behavior.
 
 Methods:
@@ -226,5 +228,5 @@ node scripts/run-e2e-loop.mjs --runs 5 --timeoutMs 15000 --spec tests/vue3-15-pe
 - WebRTC + browser automation is inherently flaky across engines; timeouts are tuned for stability rather than strict guarantees.
 - The default signaling endpoint is a third-party service. Treat room IDs and client IDs as metadata visible to that signaling layer.
 - This is not a security boundary. If you need authz/authn, abuse protection, persistence, or app-layer encryption, add them in your application.
-- Membership convergence is eventually consistent. A peer may temporarily know about fewer peers than another peer.
-- The current implementation is CECR-inspired, but does not yet implement coordinate embedding or extrema-based routing.
+- Membership convergence is eventually consistent and node-local. A peer may temporarily know about fewer peers than another peer.
+- CECR routing in this implementation uses local extrema snapshots from each node's current membership view, not a globally synchronized set hash.

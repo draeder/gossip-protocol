@@ -220,10 +220,12 @@ export class GossipProtocol {
    * Returns a BigInt (lower = closer).
    */
   private xorDistance(a: string, b: string): bigint {
-    // Strip hyphens (UUID format) and compare hex segments
-    const ha = a.replace(/-/g, '').toLowerCase().slice(0, 16).padEnd(16, '0');
-    const hb = b.replace(/-/g, '').toLowerCase().slice(0, 16).padEnd(16, '0');
-    return BigInt('0x' + ha) ^ BigInt('0x' + hb);
+    const left = this.peerIdToNumeric(a);
+    const right = this.peerIdToNumeric(b);
+    if (left == null || right == null) {
+      throw new Error('Peer IDs are not comparable in XOR space');
+    }
+    return left ^ right;
   }
 
   /**
@@ -249,9 +251,8 @@ export class GossipProtocol {
   private peerIdToNumeric(peerId: string): bigint | null {
     try {
       const hex = peerId.replace(/-/g, '').toLowerCase();
-      if (!hex) return null;
-      const compact = hex.slice(0, 16).padEnd(16, '0');
-      return BigInt('0x' + compact);
+      if (!hex || !/^[0-9a-f]+$/.test(hex)) return null;
+      return BigInt('0x' + hex);
     } catch {
       return null;
     }

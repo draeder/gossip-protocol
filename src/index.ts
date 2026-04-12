@@ -202,6 +202,7 @@ export class PartialMesh {
     this.signalingClient.on('peer-left', (data: { peerId: string }) => {
       const peerId = this.normalizePeerId(data.peerId);
       if (!peerId) return;
+      this.removeFromGlobalMembership(peerId);
       this.discoveredPeers.delete(peerId);
       this.removePeer(peerId, true);
     });
@@ -730,6 +731,17 @@ export class PartialMesh {
         }
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
+        }
+      }
+    }
+
+    private removeFromGlobalMembership(peerId: string): void {
+      const removed = this.globalPeers.delete(peerId);
+      if (!removed) return;
+      this.emit('mesh:membership', Array.from(this.globalPeers));
+      for (const connectedPeerId of this.getConnectedPeers()) {
+        if (connectedPeerId !== peerId) {
+          this.sendMembership(connectedPeerId);
         }
       }
     }
