@@ -1,11 +1,28 @@
 # gossip-protocol
 
-WebRTC peer-to-peer networking (`PartialMesh`) plus an example “gossip protocol” implementation that re-propagates messages across connected peers.
+WebRTC peer-to-peer networking (`PartialMesh`) plus a small gossip layer (`GossipProtocol`) for broadcast and direct messaging over a partial mesh.
 
 This package is intentionally small:
 
-- The library exports `PartialMesh` (best-effort WebRTC partial mesh connection manager).
-- The library also exports `GossipProtocol`, a tiny re-propagation helper used by the demo.
+- The library exports `PartialMesh`, a best-effort WebRTC partial-mesh connection manager.
+- The library exports `GossipProtocol`, a small application-layer helper for gossip broadcast and routed direct messages.
+- The current routing model includes membership convergence via gossip, XOR-routed direct messages, and fan-out scaling via $\lceil \log_2(N+1) \rceil$.
+
+Research note:
+
+- CECR, Convergent Extremal Coordinate Routing, is research derived from this work and documents a broader routing model that extends beyond the current implementation: https://gist.github.com/draeder/ac0405667048fcec10b4c8408f1cc768
+
+What is implemented today:
+
+- In-band membership gossip so peers gradually converge on a larger shared peer set than their immediate connections.
+- Gossip broadcast with adaptive fan-out based on estimated network size.
+- XOR-routed direct messages that can traverse intermediate peers.
+
+What is not implemented today:
+
+- Extremal coordinate embedding using global min/max.
+- Coordinate-proximity routing decisions.
+- Formal CECR stability logic around stale extrema and bounded drift.
 
 ## Install
 
@@ -16,7 +33,7 @@ npm i gossip-protocol
 Notes:
 
 - Designed for browsers (WebRTC required). Node.js is used for tooling/tests.
-- Signaling uses UniWRTC; by default the demo points at a public server.
+- Signaling uses FreeRTC; by default the demo points at a public server.
 
 ## Quick start
 
@@ -29,9 +46,13 @@ const mesh = new PartialMesh({
 	maxPeers: 5,
 });
 
-const gossip = new GossipProtocol(mesh, { maxHops: 5 });
+const gossip = new GossipProtocol(mesh, { maxHops: 5, maxDirectHops: 20 });
 gossip.on('messageReceived', ({ message, local }) => {
 	console.log(local ? 'local' : 'remote', message);
+});
+
+gossip.on('directMessageReceived', ({ message }) => {
+	console.log('direct message', message.from, '->', message.to, message.data);
 });
 
 mesh.on('signaling:connected', ({ clientId }) => {
@@ -49,8 +70,8 @@ mesh.on('peer:data', ({ peerId, data }) => {
 await mesh.init();
 
 // Later:
-// mesh.broadcast('hello');
-// mesh.send(peerId, 'direct message');
+// gossip.broadcast('hello');
+// gossip.sendDirect(targetPeerId, 'private message');
 // mesh.destroy();
 ```
 
@@ -66,7 +87,7 @@ Configuration (all optional):
 - `sessionId` (default `default-session`): room ID used for discovery.
 - `autoDiscover` (default `true`): automatically join `sessionId` on signaling connect.
 - `autoConnect` (default `true`): automatically converge to the target connection count.
-- `iceServers` (default: Google STUN): passed to WebRTC for ICE.
+- `iceServers` (default `null`): passed to WebRTC for ICE. `null` uses FreeRTC defaults.
 - `connectionTimeoutMs` (default `25000`): time to wait for a peer to reach `connect` before retrying.
 - `maintenanceIntervalMs` (default `2000`): how often to run the convergence loop.
 - `underConnectedResetMs` (default `0` / disabled): if > 0, triggers a periodic `hardReset()` when the mesh stays below `minPeers` despite having enough discovered peers.
@@ -89,6 +110,7 @@ Configuration (all optional):
 	- Sends data to all connected peers.
 - `getConnectedPeers(): string[]`
 - `getDiscoveredPeers(): string[]`
+- `getGlobalPeers(): string[]`
 - `getPeerCount(): number`
 - `getClientId(): string | null`
 - `on(event, handler): void` / `off(event, handler): void`
@@ -104,6 +126,38 @@ Configuration (all optional):
 - `peer:data` → `{ peerId: string, data: any }` (typically a Buffer-like payload)
 - `peer:error` → `{ peerId: string, error: any }`
 - `mesh:ready` → emitted when `connectedPeers.length >= minPeers`
+- `mesh:membership` → `peers: string[]` emitted when the converged global peer set changes
+
+### `new GossipProtocol(mesh, options?)`
+
+Configuration:
+
+- `maxHops` (default `5`): base maximum hops for broadcast gossip.
+- `maxDirectHops` (default `20`): maximum hops for a direct/routed message before it is dropped.
+
+Behavior:
+
+- Broadcast fan-out scales with estimated network size using $\max(2, \lceil \log_2(N+1) \rceil)$.
+- Broadcast max hops is also scaled upward based on estimated network size.
+- Direct messages are routed toward the connected peer with the smallest XOR distance to the target peer ID.
+
+Methods:
+
+- `broadcast(data: unknown, metadata?: Record<string, unknown>): string`
+	- Broadcasts an application payload through the partial mesh and returns the message ID.
+- `sendDirect(targetPeerId: string, data: unknown): string | null`
+	- Sends a direct message toward `targetPeerId` through the mesh and returns the message ID, or `null` if the local peer ID is not ready.
+- `getStats(): GossipStats`
+- `cleanup(maxAgeMs?: number): void`
+- `destroy(): void`
+- `on(event, handler): void` / `off(event, handler): void`
+
+Events:
+
+- `messageReceived` → `{ message: GossipMessage, local: boolean, fromPeer?: string }`
+- `directMessageReceived` → `{ message: DirectMessage }`
+- `peerConnected` → `{ peerId: string }`
+- `peerDisconnected` → `{ peerId: string }`
 
 ## Vue 3 demo (gossip)
 
@@ -126,6 +180,14 @@ Autostart parameters:
 Example:
 
 `http://127.0.0.1:5173/?autostart=1&maxPeers=10&minPeers=2&sessionId=my-room`
+
+The Vue demo currently includes:
+
+- editable signaling server, network name, room/session ID, min/max peers
+- adaptive gossip status display
+- network graph of direct connections
+- broadcast chat
+- direct-message UI backed by routed DMs
 
 ## Tests (Playwright e2e loop)
 
@@ -162,3 +224,5 @@ node scripts/run-e2e-loop.mjs --runs 5 --timeoutMs 15000 --spec tests/vue3-15-pe
 - WebRTC + browser automation is inherently flaky across engines; timeouts are tuned for stability rather than strict guarantees.
 - The default signaling endpoint is a third-party service. Treat room IDs and client IDs as metadata visible to that signaling layer.
 - This is not a security boundary. If you need authz/authn, abuse protection, persistence, or app-layer encryption, add them in your application.
+- Membership convergence is eventually consistent. A peer may temporarily know about fewer peers than another peer.
+- The current implementation is CECR-inspired, but does not yet implement coordinate embedding or extrema-based routing.
