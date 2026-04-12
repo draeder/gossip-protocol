@@ -359,7 +359,6 @@ export default {
 
         this.mesh.on('mesh:ready', () => {
           this.addLog('info', 'Gossip reached ready state', 'System');
-          this.showStatus('Ready', 'Gossip OK', 'success');
         });
 
         // Gossip events
@@ -433,6 +432,26 @@ export default {
       if (this.mesh) {
         this.connectedPeersList = this.mesh.getConnectedPeers();
         this.discoveredPeersList = this.mesh.getDiscoveredPeers();
+      }
+
+      this.syncGossipStatus();
+    },
+
+    requiredConnectedPeersForGossip() {
+      return this.maxPeers <= 1 ? 1 : 2;
+    },
+
+    syncGossipStatus() {
+      if (!this.isRunning) return;
+      if (this.status.type === 'error') return;
+
+      const connected = this.connectedPeersList.length;
+      const required = this.requiredConnectedPeersForGossip();
+
+      if (connected >= required) {
+        this.showStatus('Ready', `Gossip OK (${connected}/${required} connected)`, 'success');
+      } else {
+        this.showStatus('Connecting', `Waiting for peers (${connected}/${required} connected)`, 'connecting');
       }
     },
 
