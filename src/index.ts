@@ -448,30 +448,6 @@ export class PartialMesh {
         this.emit('peer:error', { peerId, error: err });
         this.removePeer(peerId);
       });
-    } else {
-      // Discovery can be one-sided for a while: the newly joined peer often sees the
-      // existing peer first, while the existing peer is not notified immediately.
-      // If no inbound WebRTC state appears after a short grace period, fall back to
-      // initiating from this side to avoid waiting indefinitely.
-      setTimeout(() => {
-        const current = this.peers.get(peerId);
-        if (!current || current.connected || !this.connecting.has(peerId)) return;
-
-        const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peerId);
-        if (rtcEntry) return;
-
-        this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err: any) => {
-          this.connecting.delete(peerId);
-          this.noteDialFailure(peerId);
-          const t = this.connectionTimers.get(peerId);
-          if (t) {
-            clearTimeout(t);
-            this.connectionTimers.delete(peerId);
-          }
-          this.emit('peer:error', { peerId, error: err });
-          this.removePeer(peerId);
-        });
-      }, 7_000);
     }
     // Non-initiator: FreeRTC handles the incoming offer entirely on its own.
     // We'll receive an rtc:connected event when the data channel opens.
