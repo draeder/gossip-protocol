@@ -80,7 +80,9 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-dist
+
+# Package build output is committed for branch installs.
+!/dist
 
 # Gatsby files
 .cache/
