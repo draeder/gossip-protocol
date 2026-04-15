@@ -3,21 +3,23 @@
   "version": "1.0.0",
   "description": "Gossip-style message propagation over a WebRTC partial mesh (PartialMesh) with FreeRTC signaling",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    }
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts",
+    "build": "tsup src/index.ts --format esm,cjs --dts",
     "build:browser": "tsup --config tsup.browser.config.ts",
     "dev": "cd examples/vue3 && npm run dev --",
     "prepublishOnly": "npm run build",
