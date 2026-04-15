@@ -16,7 +16,7 @@
               :disabled="isRunning || isConnecting"
               class="input"
               data-testid="signaling-server"
-              placeholder="wss://peer.ooo/ws"
+              placeholder="wss://peer-ooo-worker-devtest.draeder.workers.dev/ws"
             />
           </label>
 
@@ -196,6 +196,23 @@
         </div>
       </section>
 
+      <!-- Diagnostics -->
+      <section class="chat diagnostics" v-if="isRunning">
+        <h3>🛠 Diagnostics</h3>
+        <div ref="diagLogContainer" class="log-container diag-container" data-testid="diag-log">
+          <div
+            v-for="(entry, idx) in diagnosticMessages"
+            :key="`diag-${idx}`"
+            class="diag-entry"
+          >
+            <span class="diag-time">{{ formatTime(entry.timestamp) }}</span>
+            <span class="diag-sender">{{ entry.sender }}</span>
+            <span class="diag-text">{{ entry.text }}</span>
+          </div>
+          <div v-if="diagnosticMessages.length === 0" class="diag-empty">No diagnostics yet</div>
+        </div>
+      </section>
+
       <!-- Direct Messages -->
       <section class="chat dm-section" v-if="isRunning">
         <h3>📩 Direct Message</h3>
@@ -263,7 +280,7 @@ export default {
       topology: 'token-ring',
       networkName: 'gossip',
       roomSessionId: '',
-      signalingServer: 'wss://peer.ooo/ws',
+      signalingServer: 'wss://peer-ooo-worker-devtest.draeder.workers.dev/ws',
       messageLog: [],
       autoScroll: true,
       status: {
@@ -271,12 +288,21 @@ export default {
         message: '',
         type: 'info'
       },
-      uiStateKey: 'gossip-protocol:ui-state'
+      uiStateKey: 'gossip-protocol:ui-state',
+      debugMonitorTimer: null,
+      debugLastByPeer: {}
     };
   },
   mounted() {
+    window.__app = this;
     const params = new URLSearchParams(window.location.search);
 
+    // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
+    // Check for explicit sessionId param FIRST (before any localStorage fallback)
+    const sessionIdParam = params.get('sessionId') || params.get('roomSessionId') || params.get('room');
+    const hasExplicitSessionId = sessionIdParam != null;
+
+    // Parse all other URL params
     const topologyParam = (params.get('topology') || '').trim().toLowerCase();
     if (this.isKnownTopology(topologyParam)) {
       this.topology = topologyParam;
@@ -289,20 +315,25 @@ export default {
       this.applyTopologyPreset(this.topology);
     }
 
-    // Use a browser-local room by default to keep tabs in the same network.
-    const storageKey = 'gossip-protocol:room-session-id';
-    const ensureLocalRoomSessionId = () => {
-      try {
-        const existing = localStorage.getItem(storageKey);
-        if (existing && existing.trim()) return existing.trim();
-        const generated = `gp-${Math.random().toString(36).slice(2, 10)}`;
-        localStorage.setItem(storageKey, generated);
-        return generated;
-      } catch {
-        return `gp-${Math.random().toString(36).slice(2, 10)}`;
-      }
-    };
-    this.roomSessionId = ensureLocalRoomSessionId();
+    // Only use localStorage sessionId if NO explicit URL param was provided
+    // This ensures test URLs (with __test_* sessionIds) are never overridden
+    if (hasExplicitSessionId) {
+      this.roomSessionId = sessionIdParam;
+    } else {
+      const storageKey = 'gossip-protocol:room-session-id';
+      const ensureLocalRoomSessionId = () => {
+        try {
+          const existing = localStorage.getItem(storageKey);
+          if (existing && existing.trim()) return existing.trim();
+          const generated = `gp-${Math.random().toString(36).slice(2, 10)}`;
+          localStorage.setItem(storageKey, generated);
+          return generated;
+        } catch {
+          return `gp-${Math.random().toString(36).slice(2, 10)}`;
+        }
+      };
+      this.roomSessionId = ensureLocalRoomSessionId();
+    }
 
     const maxPeersParam = Number(params.get('maxPeers'));
     if (Number.isFinite(maxPeersParam) && maxPeersParam >= 1) {
@@ -323,16 +354,6 @@ export default {
     const networkNameParam = params.get('networkName') || params.get('network');
     if (networkNameParam) {
       this.networkName = networkNameParam;
-    }
-
-    const sessionIdParam = params.get('sessionId');
-    if (sessionIdParam) {
-      this.roomSessionId = sessionIdParam;
-    }
-
-    const roomSessionIdParam = params.get('roomSessionId') || params.get('room');
-    if (roomSessionIdParam) {
-      this.roomSessionId = roomSessionIdParam;
     }
 
     const signalingServerParam = params.get('signalingServer') || params.get('signalUrl');
@@ -364,6 +385,9 @@ export default {
     chatMessages() {
       return this.messageLog.filter(e => e.type === 'sent' || e.type === 'received');
     },
+    diagnosticMessages() {
+      return this.messageLog.filter(e => e.type !== 'sent' && e.type !== 'received');
+    },
     dmMessages() {
       return this.dmLog;
     }
@@ -374,6 +398,9 @@ export default {
       if (!last) return;
       if ((last.type === 'sent' || last.type === 'received') && this.autoScroll) {
         this.$nextTick(() => this.scrollToBottom());
+      }
+      if ((last.type !== 'sent' && last.type !== 'received') && this.autoScroll) {
+        this.$nextTick(() => this.scrollDiagToBottom());
       }
     }
   },
@@ -462,7 +489,8 @@ export default {
         this.reconcileTopologyWithPeerBounds();
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
-        this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
+        this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer-ooo-worker-devtest.draeder.workers.dev/ws';
+        this.updateUrlState();
 
         try {
           localStorage.setItem('gossip-protocol:room-session-id', this.roomSessionId || `gp-${Math.random().toString(36).slice(2, 10)}`);
@@ -472,6 +500,8 @@ export default {
         } catch {
           // ignore storage errors
         }
+
+        this.updateUrlState();
 
         this.isConnecting = true;
         this.showStatus('Connecting...', 'Initializing PartialMesh with Gossip Protocol...', 'connecting');
@@ -483,9 +513,10 @@ export default {
           maxPeers: this.maxPeers,
           autoDiscover: true,
           autoConnect: true,
-          // If the mesh stays under-connected for too long (common in flaky WebRTC automation),
-          // force a full peer-connection reset to recover.
-          underConnectedResetMs: 30_000
+          // Helps highest-lexicographic peers (often Chrome in mixed-browser sessions)
+          // avoid indefinite non-initiator wait when all discovered peers are smaller IDs.
+          nonInitiatorFallbackDialMs: 8_000,
+          underConnectedResetMs: 20_000
         });
 
         this.gossip = new GossipProtocol(this.mesh);
@@ -505,6 +536,14 @@ export default {
           this.updateStats();
         });
 
+        this.mesh.on('signaling:connected', () => {
+          this.addLog(
+            'info',
+            `Discovery snapshot: discovered=${this.mesh.getDiscoveredPeers().length}, connected=${this.mesh.getConnectedPeers().length}`,
+            'debug'
+          );
+        });
+
         this.mesh.on('peer:connected', (peerId) => {
           this.addLog('connected', `Connected to peer`, peerId);
           this.updateStats();
@@ -513,6 +552,18 @@ export default {
         this.mesh.on('peer:disconnected', (peerId) => {
           this.addLog('disconnected', `Disconnected from peer`, peerId);
           this.updateStats();
+        });
+
+        this.mesh.on('peer:error', ({ peerId, error }) => {
+          const message = String(error?.message || error || 'unknown error');
+          this.addLog('info', `Peer error: ${message}`, peerId || 'peer');
+          this.updateStats();
+        });
+
+        this.mesh.on('peer:discovered', (peerId) => {
+          const self = String(this.mesh?.getClientId?.() || '').trim();
+          const initiator = self && peerId ? self < peerId : false;
+          this.addLog('info', `Dial role -> ${initiator ? 'initiator' : 'non-initiator(wait)'}`, peerId || 'debug');
         });
 
         this.mesh.on('mesh:membership', () => {
@@ -543,6 +594,10 @@ export default {
           this.showStatus('Error', `${error.message || error}`, 'error');
         });
 
+        this.mesh.on('signaling:log', ({ message }) => {
+          this.addLog('info', message, 'freertc');
+        });
+
         this.gossip.on('directMessageReceived', ({ message }) => {
           this.dmLog.push({
             local: false,
@@ -559,6 +614,7 @@ export default {
         this.isRunning = true;
         this.isConnecting = false;
         this.updateStats();
+        this.startDebugMonitor();
 
         // Best-effort warning only; do not hard-fail startup on transient signaling slowness.
         setTimeout(() => {
@@ -575,6 +631,7 @@ export default {
     },
 
     stopMesh() {
+      this.stopDebugMonitor();
       if (this.mesh) {
         this.mesh.destroy();
         this.mesh = null;
@@ -681,14 +738,22 @@ export default {
     },
 
     addLog(type, text, sender = 'System', hops = 0, local = false) {
-      this.messageLog.push({
+      const entry = {
         type,
         text,
         sender,
         hops,
         timestamp: new Date(),
         local
-      });
+      };
+
+      this.messageLog.push(entry);
+
+      if (import.meta.env.DEV) {
+        // Mirror all app logs to browser console for rapid debugging.
+        // eslint-disable-next-line no-console
+        console.log(`[mesh:${type}] ${sender} ${text}`);
+      }
 
       // Keep log size manageable
       if (this.messageLog.length > 100) {
@@ -704,6 +769,86 @@ export default {
       this.status = { title, message, type };
     },
 
+
+    startDebugMonitor() {
+      this.stopDebugMonitor();
+      this.debugLastByPeer = {};
+
+      this.debugMonitorTimer = setInterval(() => {
+        try {
+          const rawClient = this.mesh?.signalingClient?.client;
+          const connections = rawClient?.mesh?.connections;
+          if (!connections || typeof connections.entries !== 'function') return;
+
+          for (const [peerId, entry] of connections.entries()) {
+            const snapshot = {
+              mesh: String(entry?.state || ''),
+              pc: String(entry?.connection?.connectionState || ''),
+              ice: String(entry?.connection?.iceConnectionState || ''),
+              signaling: String(entry?.connection?.signalingState || ''),
+              dc: String(entry?.channel?.readyState || '')
+            };
+
+            const previous = this.debugLastByPeer[peerId];
+            const changed = !previous ||
+              previous.mesh !== snapshot.mesh ||
+              previous.pc !== snapshot.pc ||
+              previous.ice !== snapshot.ice ||
+              previous.signaling !== snapshot.signaling ||
+              previous.dc !== snapshot.dc;
+
+            if (changed) {
+              this.debugLastByPeer[peerId] = snapshot;
+              this.addLog(
+                'info',
+                `conn(mesh=${snapshot.mesh || '-'}, pc=${snapshot.pc || '-'}, ice=${snapshot.ice || '-'}, sig=${snapshot.signaling || '-'}, dc=${snapshot.dc || '-'})`,
+                peerId
+              );
+            }
+          }
+        } catch {
+          // ignore debug monitor failures
+        }
+      }, 500);
+    },
+
+    stopDebugMonitor() {
+      if (this.debugMonitorTimer) {
+        clearInterval(this.debugMonitorTimer);
+        this.debugMonitorTimer = null;
+      }
+      this.debugLastByPeer = {};
+    },
+
+    updateUrlState() {
+      try {
+        const url = new URL(window.location.href);
+        // Preserve original query params to avoid disturbing tests or manual URL state
+        const originalParams = new URLSearchParams(window.location.search);
+        
+        // Update only the configuration params; preserve any explicitly provided sessionId
+        url.searchParams.set('topology', this.topology);
+        url.searchParams.set('minPeers', String(this.minPeers));
+        url.searchParams.set('maxPeers', String(this.maxPeers));
+        if (this.networkName) url.searchParams.set('networkName', this.networkName);
+        
+        // Only sync sessionId to URL if it wasn't explicitly provided in the original URL
+        // This prevents tests' __test_* sessionIds from being modified
+        const hadExplicitSessionId = originalParams.has('sessionId') || originalParams.has('roomSessionId') || originalParams.has('room');
+        if (hadExplicitSessionId) {
+          // Keep original sessionId param as-is
+          url.searchParams.set('sessionId', originalParams.get('sessionId') || originalParams.get('roomSessionId') || originalParams.get('room'));
+        } else if (this.roomSessionId) {
+          // Update sessionId only if no explicit one was provided originally
+          url.searchParams.set('sessionId', this.roomSessionId);
+        }
+        
+        window.history.replaceState({}, '', url.toString());
+      } catch {
+        // ignore URL state errors
+      }
+    },
+
     formatTime(date) {
       return new Date(date).toLocaleTimeString();
     },
@@ -715,6 +860,12 @@ export default {
 
     scrollDmToBottom() {
       const container = this.$refs.dmLogContainer;
+      if (!container) return;
+      container.scrollTop = container.scrollHeight;
+    },
+
+    scrollDiagToBottom() {
+      const container = this.$refs.diagLogContainer;
       if (!container) return;
       container.scrollTop = container.scrollHeight;
     },
@@ -748,6 +899,7 @@ export default {
   },
 
   beforeUnmount() {
+    this.stopDebugMonitor();
     this.stopMesh();
   }
 };
@@ -778,6 +930,7 @@ header h1 {
   font-size: 2.5rem;
   margin-bottom: 0.5rem;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background-clip: text;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
@@ -879,6 +1032,50 @@ section {
 
 .message-input .btn {
   flex: 0 0 120px;
+}
+
+.diagnostics {
+  border-top: 4px solid #2f6fec;
+}
+
+.diag-container {
+  max-height: 260px;
+  overflow: auto;
+  background: #0f172a;
+  color: #d1e3ff;
+  border: 1px solid #1e293b;
+}
+
+.diag-entry {
+  display: grid;
+  grid-template-columns: 90px 120px 1fr;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  font-family: 'Monaco', 'Courier New', monospace;
+  font-size: 0.82rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.diag-time {
+  color: #8ec5ff;
+}
+
+.diag-sender {
+  color: #b0f2c2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diag-text {
+  color: #e5e7eb;
+  word-break: break-word;
+}
+
+.diag-empty {
+  padding: 0.6rem;
+  color: #94a3b8;
+  font-size: 0.85rem;
 }
 
 .input:focus {

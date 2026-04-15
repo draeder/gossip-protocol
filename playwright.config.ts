@@ -11,14 +11,14 @@ export default defineConfig({
   workers: 1,
   retries: process.env.CI ? 1 : 0,
   use: {
-    baseURL: 'http://127.0.0.1:5173',
+    baseURL: 'http://127.0.0.1:5183',
     headless: true,
     viewport: { width: 900, height: 700 }
   },
   webServer: {
-    command: 'cd examples/vue3 && npm run dev -- --host 127.0.0.1 --port 5173 --strictPort --clearScreen false',
-    url: 'http://127.0.0.1:5173',
-    reuseExistingServer: !process.env.CI,
+    command: 'cd examples/vue3 && npm run dev -- --host 127.0.0.1 --port 5183 --strictPort --clearScreen false',
+    url: 'http://127.0.0.1:5183',
+    reuseExistingServer: false,
     timeout: 120_000,
     stdout: 'pipe',
     stderr: 'pipe'

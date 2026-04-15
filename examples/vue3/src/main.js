@@ -1,7 +1,25 @@
 import { createApp } from 'vue';
 import App from './App.vue';
 
-if ('serviceWorker' in navigator) {
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+	window.addEventListener('load', async () => {
+		try {
+			if ('serviceWorker' in navigator) {
+				const regs = await navigator.serviceWorker.getRegistrations();
+				await Promise.all(regs.map((reg) => reg.unregister()));
+			}
+
+			if ('caches' in window) {
+				const keys = await caches.keys();
+				await Promise.all(keys.map((key) => caches.delete(key)));
+			}
+		} catch {
+			// ignore cleanup failures in dev
+		}
+	});
+}
+
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
 	window.addEventListener('load', async () => {
 		try {
 			await navigator.serviceWorker.register('/sw.js', { scope: '/' });

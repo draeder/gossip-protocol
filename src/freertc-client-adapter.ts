@@ -1,6 +1,13 @@
-import { createSignalingClient } from 'freertc/demo/src/utils/signalingClient.js';
+import { RtcPeer } from './rtc-peer.js';
 
 type Handler = (...args: any[]) => void;
+
+function generatePeerId(): string {
+  const bytes = new Uint8Array(32);
+  const webCrypto = globalThis.window?.crypto ?? globalThis.crypto;
+  webCrypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+}
 
 class Emitter {
   private handlers = new Map<string, Set<Handler>>();
@@ -27,18 +34,36 @@ class Emitter {
 export class FreeRTCClientAdapter {
   private readonly signalUrl: string;
   private readonly networkId: string;
-  private readonly peerId: string;
+  private readonly requestedPeerId: string;
+  private readonly defaultIceServers: RTCIceServer[] | null;
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
+  private readonly pendingCandidates = new Map<string, any[]>();
+  private readonly offerQueues = new Map<string, Promise<void>>();
+  private readonly lastRemoteOfferSdp = new Map<string, string>();
+  private readonly lastAppliedAnswerSdp = new Map<string, string>();
+  private readonly selfAliases = new Set<string>();
+  private readonly peerEntries = new Map<string, any>();
   private client: any = null;
   private joinedOnce = false;
-  private connectedEmitted = false;
-  private announcePulseTimer: ReturnType<typeof setInterval> | null = null;
+  private socket: WebSocket | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private announceTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectBackoffMs = 1_000;
+  private intentionallyDisconnected = false;
 
-  constructor(signalUrl: string, options?: { networkId?: string; peerId?: string }) {
+  constructor(signalUrl: string, options?: { networkId?: string; peerId?: string; iceServers?: RTCIceServer[] | null }) {
     this.signalUrl = signalUrl;
     this.networkId = options?.networkId ?? 'default-session';
-    this.peerId = options?.peerId ?? (globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2));
+    this.requestedPeerId = options?.peerId ?? generatePeerId();
+    this.defaultIceServers = options?.iceServers ?? null;
+    this.addSelfAlias(this.requestedPeerId);
+    this.client = {
+      mesh: { connections: this.peerEntries },
+      peerId: this.requestedPeerId,
+      isRegistered: true
+    };
   }
 
   on(event: string, handler: Handler): void {
@@ -46,38 +71,146 @@ export class FreeRTCClientAdapter {
   }
 
   connect(): void {
-    if (this.client) return;
-    this.connectedEmitted = false;
+    this.intentionallyDisconnected = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
-    this.client = createSignalingClient({
-      peerId: this.peerId,
-      networkId: this.networkId,
-      signalUrl: this.signalUrl,
-      autoConnect: false,
-      onRegistered: () => {
-        this.emitConnectedOnce();
-      },
-      onStatusChange: (status: string) => {
-        if (status === 'connected') {
-          // WebSocket is open; emit early so callers can show client id/status.
-          this.emitConnectedOnce();
-        }
-        if (status === 'registered') {
-          this.emitConnectedOnce();
-        }
-        if (status.startsWith('disconnected')) {
-          this.emitter.emit('disconnected');
-        }
-      },
-      onBootstrap: (candidates: Array<{ peerId: string }>) => {
+    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    const wsUrl = new URL(this.signalUrl, typeof location !== 'undefined' ? location.href : undefined);
+    if (!wsUrl.searchParams.get('networkId')) {
+      wsUrl.searchParams.set('networkId', this.networkId);
+    }
+
+    this.socket = new WebSocket(wsUrl.toString());
+    this.socket.onopen = () => {
+      this.reconnectBackoffMs = 1_000;
+      this.emitter.emit('signaling:log', { message: '[signal] connected' });
+      this.sendEnvelope('announce', {
+        ttl_ms: 30_000,
+        body: { hints: { wants_peers: true } }
+      });
+      this.startPingLoop();
+      this.startAnnounceLoop();
+      this.emitter.emit('connected', {
+        clientId: this.requestedPeerId,
+        requestedClientId: this.requestedPeerId,
+        previousClientId: null
+      });
+    };
+
+    this.socket.onmessage = (event) => {
+      this.handleSocketMessage(event.data);
+    };
+
+    this.socket.onclose = () => {
+      this.stopLoops();
+      this.socket = null;
+      this.closeAllPeerEntries();
+      this.emitter.emit('disconnected');
+      this.scheduleReconnect();
+    };
+
+    this.socket.onerror = () => {
+      this.emitter.emit('error', new Error('WebSocket error'));
+    };
+  }
+
+  private scheduleReconnect(): void {
+    if (this.intentionallyDisconnected) return;
+    if (this.reconnectTimer) return;
+
+    const delay = this.reconnectBackoffMs;
+    this.reconnectBackoffMs = Math.min(15_000, Math.floor(this.reconnectBackoffMs * 1.5));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  private normalizePeerId(peerId: string | null | undefined): string {
+    return String(peerId ?? '').trim();
+  }
+
+  private addSelfAlias(peerId: string | null | undefined): void {
+    const id = this.normalizePeerId(peerId);
+    if (!id) return;
+    this.selfAliases.add(id);
+  }
+
+  private isSelfAlias(peerId: string | null | undefined): boolean {
+    const id = this.normalizePeerId(peerId);
+    if (!id) return false;
+    return this.selfAliases.has(id);
+  }
+
+  private startPingLoop(): void {
+    if (this.pingTimer) return;
+    this.pingTimer = setInterval(() => {
+      this.sendEnvelope('ping', { body: { nonce: generatePeerId().slice(0, 16) } });
+    }, 1_000);
+  }
+
+  private startAnnounceLoop(): void {
+    if (this.announceTimer) return;
+    this.announceTimer = setInterval(() => {
+      this.sendEnvelope('announce', {
+        ttl_ms: 30_000,
+        body: { hints: { wants_peers: true } }
+      });
+    }, 12_000);
+  }
+
+  private stopLoops(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    if (this.announceTimer) {
+      clearInterval(this.announceTimer);
+      this.announceTimer = null;
+    }
+  }
+
+  private sendEnvelope(type: string, options: { to?: string | null; body?: any; ttl_ms?: number | null; session_id?: string | null } = {}): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+
+    this.socket.send(JSON.stringify({
+      psp_version: '1.0',
+      type,
+      network: this.networkId,
+      from: this.requestedPeerId,
+      to: options.to ?? null,
+      session_id: options.session_id ?? null,
+      message_id: generatePeerId().slice(0, 16),
+      timestamp: Date.now(),
+      ttl_ms: options.ttl_ms ?? null,
+      body: options.body ?? {}
+    }));
+  }
+
+  private handleSocketMessage(raw: any): void {
+    let message: any;
+    try {
+      message = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    switch (message?.type) {
+      case 'peer_list': {
+        const peers = Array.isArray(message?.body?.peers) ? message.body.peers : [];
         const nextPeers = new Set(
-          candidates
-            .map((c) => String(c?.peerId ?? '').trim())
-            .filter((id) => id && id !== this.peerId)
+          peers
+            .map((peer: any) => this.normalizePeerId(peer?.peer_id))
+            .filter((peerId: string) => peerId && !this.isSelfAlias(peerId))
         );
 
         const peerList = Array.from(nextPeers);
-
         if (!this.joinedOnce) {
           this.joinedOnce = true;
           this.emitter.emit('joined', { sessionId: this.networkId, clients: peerList });
@@ -99,125 +232,326 @@ export class FreeRTCClientAdapter {
         for (const peerId of nextPeers) {
           this.knownPeers.add(peerId);
         }
-      },
-      onConnectionStateChange: ({ peerId, state }: { peerId: string; state: string }) => {
-        if (state === 'connected') {
-          // Wait for the data channel to open before signalling up.
-          // On slower/contended environments this can take several seconds.
-          const maxRetries = 600; // 30s @ 50ms intervals
-          const checkChannelOpen = (retries = 0) => {
-            const entry = this.client?.mesh?.connections?.get(peerId);
-            if (!entry) return; // connection removed — skip
-            const entryState = entry.state;
-            if (entryState === 'failed' || entryState === 'closed' || entryState === 'dead') return;
-            if (entry.channel?.readyState === 'open') {
-              this.emitter.emit('rtc:connected', { peerId });
-            } else if (retries < maxRetries) {
-              setTimeout(() => checkChannelOpen(retries + 1), 50);
-            } else {
-              // Fallback: connection reached 'connected' but channel open was not observed in time.
-              this.emitter.emit('rtc:connected', { peerId });
-            }
-          };
-          setTimeout(() => checkChannelOpen(0), 0);
-        } else if (state === 'failed' || state === 'closed') {
-          this.emitter.emit('rtc:disconnected', { peerId });
+        return;
+      }
+      case 'offer':
+        this.enqueueIncomingOffer(this.normalizePeerId(message?.from), message?.body);
+        return;
+      case 'answer':
+        this.handleSignal(this.normalizePeerId(message?.from), { type: 'answer', sdp: message?.body?.sdp }).catch((error) => {
+          this.emitter.emit('signaling:log', { message: `[webrtc] answer handling error: ${String((error as any)?.message ?? error ?? '')}` });
+        });
+        return;
+      case 'ice_candidate': {
+        const candidate = this.normalizeCandidate(message?.body?.candidate);
+        if (!candidate) {
+          return;
         }
-      },
-      onDataMessage: ({ peerId, data }: { peerId: string; data: any }) => {
-        this.emitter.emit('rtc:data', { peerId, data });
-      },
+        this.handleSignal(this.normalizePeerId(message?.from), { candidate }).catch((error) => {
+          this.emitter.emit('signaling:log', { message: `[webrtc] candidate handling error: ${String((error as any)?.message ?? error ?? '')}` });
+        });
+        return;
+      }
+      case 'bye':
+        this.closeConnection(this.normalizePeerId(message?.from));
+        return;
+      case 'pong':
+        return;
+      case 'error':
+        this.emitter.emit('signaling:log', { message: `[signal] error: ${String(message?.body?.error ?? '')}` });
+        return;
+      default:
+        return;
+    }
+  }
+
+  private normalizeCandidate(candidate: any): RTCIceCandidateInit | null {
+    if (!candidate || typeof candidate !== 'object') {
+      return null;
+    }
+
+    const candidateText = String(candidate.candidate ?? '').trim();
+    if (!candidateText) {
+      // Ignore malformed/end-of-candidates messages in this path.
+      return null;
+    }
+
+    return {
+      candidate: candidateText,
+      sdpMid: candidate.sdpMid ?? null,
+      sdpMLineIndex: typeof candidate.sdpMLineIndex === 'number' ? candidate.sdpMLineIndex : null,
+      usernameFragment: candidate.usernameFragment
+    };
+  }
+
+  private attachPeer(peerId: string, peer: RtcPeer, initiator: boolean): void {
+    const entry: any = {
+      peer,
+      initiator,
+      connected: false,
+      state: 'connecting',
+      connection: (peer as any).pc,
+      channel: (peer as any).dc ?? null
+    };
+    this.peerEntries.set(peerId, entry);
+
+    peer.on('signal', (signal: any) => {
+      entry.connection = (peer as any).pc;
+      entry.channel = (peer as any).dc ?? null;
+      if (signal?.type === 'offer' || signal?.type === 'answer') {
+        this.sendEnvelope(signal.type, {
+          to: peerId,
+          body: { sdp: signal.sdp, trickle_ice: true }
+        });
+      } else if (signal?.candidate) {
+        this.sendEnvelope('ice_candidate', {
+          to: peerId,
+          body: { candidate: signal.candidate }
+        });
+      }
     });
 
-    this.client.connect();
-    this.startAnnouncePulse();
+    peer.on('connect', () => {
+      const current = this.peerEntries.get(peerId);
+      if (!current || current.connected) return;
+      current.connected = true;
+      current.state = 'connected';
+      current.connection = (peer as any).pc;
+      current.channel = (peer as any).dc ?? null;
+      this.emitter.emit('rtc:connected', { peerId });
+    });
+
+    peer.on('data', (data: any) => {
+      this.emitter.emit('rtc:data', { peerId, data });
+    });
+
+    peer.on('close', () => {
+      const current = this.peerEntries.get(peerId);
+      if (!current) return;
+      this.peerEntries.delete(peerId);
+      this.pendingCandidates.delete(peerId);
+      this.emitter.emit('rtc:disconnected', { peerId });
+    });
+
+    peer.on('error', (error: any) => {
+      this.emitter.emit('signaling:log', { message: `[webrtc] ${peerId} error: ${String(error?.message ?? error ?? '')}` });
+    });
   }
 
-  private startAnnouncePulse(): void {
-    if (this.announcePulseTimer) return;
-    this.announcePulseTimer = setInterval(() => {
-      if (!this.client) return;
-      try {
-        // peer.ooo may queue directed relay messages and release them on announce.
-        // Pulse announce/discover so offer/answer delivery does not stall for long intervals.
-        this.client.advertise?.();
-        this.client.requestBootstrap?.();
-      } catch {
-        // ignore pulse errors
+  private async handleIncomingOffer(peerId: string, body: any): Promise<void> {
+    if (!peerId) return;
+    const incomingOfferSdp = String(body?.sdp ?? '');
+    if (!incomingOfferSdp) return;
+
+    let entry = this.peerEntries.get(peerId);
+    if (!entry) {
+      const peer = new RtcPeer({
+        initiator: false,
+        trickle: true,
+        config: this.defaultIceServers ? { iceServers: this.defaultIceServers } : undefined
+      });
+      this.attachPeer(peerId, peer, false);
+      entry = this.peerEntries.get(peerId);
+    }
+
+    const pc = entry?.connection as RTCPeerConnection | undefined;
+    if (entry?.connected) {
+      return;
+    }
+
+    const lastSdp = this.lastRemoteOfferSdp.get(peerId);
+    if (lastSdp && lastSdp === incomingOfferSdp) {
+      return;
+    }
+
+    if (
+      pc?.signalingState === 'have-remote-offer' ||
+      pc?.remoteDescription?.sdp === incomingOfferSdp ||
+      (pc?.signalingState === 'stable' && !!pc?.remoteDescription)
+    ) {
+      return;
+    }
+
+    await entry.peer.signal({ type: 'offer', sdp: incomingOfferSdp });
+    this.lastRemoteOfferSdp.set(peerId, incomingOfferSdp);
+    await this.flushPendingCandidates(peerId);
+  }
+
+  private enqueueIncomingOffer(peerId: string, body: any): void {
+    if (!peerId) return;
+
+    const prior = this.offerQueues.get(peerId) ?? Promise.resolve();
+    const next = prior
+      .then(async () => {
+        await this.handleIncomingOffer(peerId, body);
+      })
+      .catch(() => {
+        // Keep queue alive on per-offer failures.
+      });
+
+    this.offerQueues.set(peerId, next);
+  }
+
+  private async handleSignal(peerId: string, signal: any): Promise<void> {
+    const entry = this.peerEntries.get(peerId);
+    if (!entry) {
+      if (signal?.candidate) {
+        const queued = this.pendingCandidates.get(peerId) ?? [];
+        queued.push(signal);
+        this.pendingCandidates.set(peerId, queued);
       }
-    }, 2_000);
+      return;
+    }
+
+    const pc = entry.connection as RTCPeerConnection | undefined;
+
+    if (signal?.candidate) {
+      if (!pc?.remoteDescription) {
+        const queued = this.pendingCandidates.get(peerId) ?? [];
+        queued.push(signal);
+        this.pendingCandidates.set(peerId, queued);
+        return;
+      }
+    }
+
+    if (signal?.type === 'answer') {
+      const answerSdp = String(signal?.sdp ?? '');
+      const lastAnswer = this.lastAppliedAnswerSdp.get(peerId);
+      if (!pc || pc.signalingState === 'stable' || pc.remoteDescription?.type === 'answer') {
+        return;
+      }
+      if (answerSdp && lastAnswer && lastAnswer === answerSdp) {
+        return;
+      }
+    }
+
+    try {
+      await entry.peer.signal(signal);
+      if (signal?.type === 'answer') {
+        if (signal?.sdp) {
+          this.lastAppliedAnswerSdp.set(peerId, String(signal.sdp));
+        }
+        await this.flushPendingCandidates(peerId);
+      }
+    } catch (error: any) {
+      const message = String(error?.message ?? error ?? '');
+      if (/wrong state|remote description was null|expected candidate got/i.test(message)) {
+        return;
+      }
+      throw error;
+    }
   }
 
-  private stopAnnouncePulse(): void {
-    if (!this.announcePulseTimer) return;
-    clearInterval(this.announcePulseTimer);
-    this.announcePulseTimer = null;
-  }
+  private async flushPendingCandidates(peerId: string): Promise<void> {
+    const entry = this.peerEntries.get(peerId);
+    if (!entry?.connection?.remoteDescription) return;
 
-  private emitConnectedOnce(): void {
-    if (this.connectedEmitted) return;
-    this.connectedEmitted = true;
-    const rawClientId = this.client?.peerId;
-    const clientId = String(rawClientId ?? this.peerId ?? '').trim();
-    this.emitter.emit('connected', { clientId });
+    const queued = this.pendingCandidates.get(peerId) ?? [];
+    this.pendingCandidates.delete(peerId);
+    for (const candidate of queued) {
+      try {
+        await entry.peer.signal(candidate);
+      } catch {
+        // ignore stale candidate failures
+      }
+    }
   }
 
   disconnect(): void {
-    this.stopAnnouncePulse();
-    if (!this.client) return;
-    this.client.disconnect();
-    this.client = null;
-    this.connectedEmitted = false;
+    this.intentionallyDisconnected = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopLoops();
+    if (this.socket) {
+      try {
+        this.socket.close(1000, 'user_disconnect');
+      } catch {
+        // ignore
+      }
+      this.socket = null;
+    }
+    this.closeAllPeerEntries();
     this.joinedOnce = false;
     this.knownPeers.clear();
   }
 
+  isConnected(): boolean {
+    return !!this.socket && this.socket.readyState === WebSocket.OPEN;
+  }
+
+  private closeAllPeerEntries(): void {
+    const entries = Array.from(this.peerEntries.entries());
+    for (const [peerId, entry] of entries) {
+      this.peerEntries.delete(peerId);
+      this.pendingCandidates.delete(peerId);
+      this.offerQueues.delete(peerId);
+      this.lastRemoteOfferSdp.delete(peerId);
+      this.lastAppliedAnswerSdp.delete(peerId);
+      try { entry.peer?.destroy?.(); } catch { /* ignore */ }
+      this.emitter.emit('rtc:disconnected', { peerId });
+    }
+  }
+
   joinSession(sessionId: string): void {
-    // FreeRTC client uses networkId set at construction; bootstrap refreshes discovery.
     if (sessionId && sessionId !== this.networkId) {
       this.emitter.emit('error', new Error('FreeRTC adapter does not support changing networkId after initialization'));
       return;
     }
-    this.requestBootstrapWhenReady(0);
-  }
-
-  private requestBootstrapWhenReady(attempt: number): void {
-    if (!this.client) return;
-    if (this.client.isRegistered) {
-      // Let FreeRTC exclude this peer by default.
-      this.client.requestBootstrap();
-      return;
-    }
-
-    // Registration can lag socket-open by a moment; retry discovery briefly.
-    if (attempt < 30) {
-      setTimeout(() => this.requestBootstrapWhenReady(attempt + 1), 300);
-    }
+    this.sendEnvelope('discover', {
+      body: { exclude_peers: [], limit: 50 }
+    });
   }
 
   async initiateConnection(peerId: string, iceServers?: RTCIceServer[] | null): Promise<void> {
-    if (!this.client) throw new Error('Not connected');
-    await this.client.initiateConnection(peerId, iceServers ?? null);
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error('Not connected');
+    }
+
+    this.closeConnection(peerId);
+    const peer = new RtcPeer({
+      initiator: true,
+      trickle: true,
+      config: (iceServers ?? this.defaultIceServers) ? { iceServers: iceServers ?? this.defaultIceServers ?? undefined } : undefined
+    });
+    this.attachPeer(peerId, peer, true);
+  }
+
+  nudgeSignaling(): void {
+    this.sendEnvelope('announce', {
+      ttl_ms: 30_000,
+      body: { hints: { wants_peers: true } }
+    });
+    this.joinSession(this.networkId);
   }
 
   closeConnection(peerId: string): void {
-    if (!this.client) return;
-    const entry = this.client.mesh?.connections?.get(peerId);
+    const entry = this.peerEntries.get(peerId);
     if (!entry) return;
-    try { entry.channel?.close(); } catch { /* ignore */ }
-    try { entry.connection?.close(); } catch { /* ignore */ }
+    this.peerEntries.delete(peerId);
+    this.pendingCandidates.delete(peerId);
+    this.offerQueues.delete(peerId);
+    this.lastRemoteOfferSdp.delete(peerId);
+    this.lastAppliedAnswerSdp.delete(peerId);
+    try { entry.peer?.destroy?.(); } catch { /* ignore */ }
   }
 
   send(peerId: string, data: string | ArrayBuffer | ArrayBufferView): void {
-    if (!this.client) throw new Error('Not connected');
-    this.client.sendData(data, peerId);
+    const entry = this.peerEntries.get(peerId);
+    if (!entry?.connected) {
+      throw new Error('WebRTC not yet connected');
+    }
+    entry.peer.send(data);
   }
 
   broadcast(data: string | ArrayBuffer | ArrayBufferView): void {
-    if (!this.client) return;
-    for (const [, entry] of (this.client.mesh?.connections ?? new Map()).entries()) {
-      if (entry.channel?.readyState === 'open') {
-        try { entry.channel.send(data); } catch { /* ignore individual send errors */ }
+    for (const [, entry] of this.peerEntries.entries()) {
+      if (!entry?.connected) continue;
+      try {
+        entry.peer.send(data);
+      } catch {
+        // ignore individual send errors
       }
     }
   }

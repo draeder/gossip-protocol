@@ -14,7 +14,8 @@ test('Vue3 demo propagates a gossip message across active peers', async ({ baseU
   const connectWaitMs = Math.min(9_000, Math.floor(budgetMs * 0.5));
   const messageWaitMs = Math.min(9_000, Math.floor(budgetMs * 0.65));
 
-  const sessionId = `pw-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const testId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  const sessionId = `__test_15peers_${testId}`;
   const url = `${baseURL}/?autostart=1&maxPeers=20&minPeers=3&sessionId=${encodeURIComponent(sessionId)}`;
 
   const browsers: { name: string; browser: Browser }[] = [];

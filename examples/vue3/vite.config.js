@@ -32,6 +32,9 @@ export default defineConfig({
     include: ['events', 'util', 'stream-browserify', 'buffer', 'process']
   },
   server: {
+    host: '127.0.0.1',
+    port: 5173,
+    strictPort: true,
     headers: {
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Pragma': 'no-cache',
