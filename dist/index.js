@@ -26,20 +26,24 @@ var RtcPeer = class {
     this.emitter = new TinyEmitter();
     this.connectedEmitted = false;
     this.initiator = options.initiator;
-    this.trickle = options.trickle ?? true;
+    this.trickleIce = options.trickleIce ?? options.trickle ?? true;
     this.pc = new RTCPeerConnection(options.config ?? {});
     this.pc.onicecandidate = (event) => {
-      if (!event.candidate) {
+      if (!event.candidate || !this.trickleIce) {
         return;
       }
       this.emitter.emit("signal", { candidate: event.candidate.toJSON() });
     };
+    this.pc.onsignalingstatechange = () => {
+      this.emitDebugSnapshot("signalingstatechange");
+    };
+    this.pc.oniceconnectionstatechange = () => {
+      this.emitDebugSnapshot("iceconnectionstatechange");
+    };
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState;
-      if (s === "connected" && !this.connectedEmitted) {
-        this.connectedEmitted = true;
-        this.emitter.emit("connect");
-      } else if (s === "failed" || s === "closed" || s === "disconnected") {
+      this.emitDebugSnapshot("connectionstatechange");
+      if (s === "failed" || s === "closed") {
         this.destroy();
       }
     };
@@ -50,6 +54,7 @@ var RtcPeer = class {
       this.attachDataChannel(this.pc.createDataChannel("gossip"));
       this.createOffer().catch((err) => this.emitter.emit("error", err));
     }
+    this.emitDebugSnapshot("constructed");
   }
   on(event, handler) {
     this.emitter.on(event, handler);
@@ -58,10 +63,11 @@ var RtcPeer = class {
     if (this.destroyed || !signal) return;
     if (signal.type === "offer" || signal.type === "answer") {
       await this.pc.setRemoteDescription(new RTCSessionDescription(signal));
+      this.emitDebugSnapshot(`remote-${signal.type}`);
       if (signal.type === "offer") {
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        this.emitter.emit("signal", this.pc.localDescription);
+        await this.emitLocalDescription("answer");
       }
       return;
     }
@@ -91,7 +97,9 @@ var RtcPeer = class {
   }
   attachDataChannel(channel) {
     this.dc = channel;
+    this.emitDebugSnapshot("datachannel-attached");
     channel.onopen = () => {
+      this.emitDebugSnapshot("datachannel-open");
       if (!this.connectedEmitted) {
         this.connectedEmitted = true;
         this.emitter.emit("connect");
@@ -101,19 +109,30 @@ var RtcPeer = class {
       this.emitter.emit("data", event.data);
     };
     channel.onerror = (event) => {
+      this.emitDebugSnapshot("datachannel-error");
       this.emitter.emit("error", event);
     };
     channel.onclose = () => {
+      this.emitDebugSnapshot("datachannel-close");
       this.destroy();
     };
   }
   async createOffer() {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
-    if (this.trickle) {
+    await this.emitLocalDescription("offer");
+  }
+  async emitLocalDescription(kind) {
+    if (this.trickleIce) {
       this.emitter.emit("signal", this.pc.localDescription);
+      this.emitDebugSnapshot(`local-${kind}`);
       return;
     }
+    await this.waitForIceGatheringComplete();
+    this.emitter.emit("signal", this.pc.localDescription);
+    this.emitDebugSnapshot(`local-${kind}-ice-complete`);
+  }
+  async waitForIceGatheringComplete() {
     await new Promise((resolve) => {
       if (this.pc.iceGatheringState === "complete") {
         resolve();
@@ -127,7 +146,15 @@ var RtcPeer = class {
       };
       this.pc.addEventListener("icegatheringstatechange", onIce);
     });
-    this.emitter.emit("signal", this.pc.localDescription);
+  }
+  emitDebugSnapshot(reason) {
+    this.emitter.emit("debug", {
+      reason,
+      signalingState: this.pc.signalingState,
+      iceConnectionState: this.pc.iceConnectionState,
+      connectionState: this.pc.connectionState,
+      dataChannelState: this.dc?.readyState ?? "missing"
+    });
   }
 };
 
@@ -180,6 +207,7 @@ var FreeRTCClientAdapter = class {
     this.networkId = options?.networkId ?? "default-session";
     this.requestedPeerId = options?.peerId ?? generatePeerId();
     this.defaultIceServers = options?.iceServers ?? null;
+    this.defaultTrickleIce = options?.trickleIce ?? true;
     this.addSelfAlias(this.requestedPeerId);
     this.client = {
       mesh: { connections: this.peerEntries },
@@ -379,6 +407,7 @@ var FreeRTCClientAdapter = class {
     const entry = {
       peer,
       initiator,
+      trickleIce: this.defaultTrickleIce,
       connected: false,
       state: "connecting",
       connection: peer.pc,
@@ -391,7 +420,7 @@ var FreeRTCClientAdapter = class {
       if (signal?.type === "offer" || signal?.type === "answer") {
         this.sendEnvelope(signal.type, {
           to: peerId,
-          body: { sdp: signal.sdp, trickle_ice: true }
+          body: { sdp: signal.sdp, trickle_ice: entry.trickleIce }
         });
       } else if (signal?.candidate) {
         this.sendEnvelope("ice_candidate", {
@@ -408,6 +437,17 @@ var FreeRTCClientAdapter = class {
       current.connection = peer.pc;
       current.channel = peer.dc ?? null;
       this.emitter.emit("rtc:connected", { peerId });
+    });
+    peer.on("debug", (snapshot) => {
+      const current = this.peerEntries.get(peerId);
+      if (current) {
+        current.connection = peer.pc;
+        current.channel = peer.dc ?? null;
+        current.state = snapshot.connectionState;
+      }
+      this.emitter.emit("signaling:log", {
+        message: `[webrtc] ${peerId} ${snapshot.reason} signaling=${snapshot.signalingState} ice=${snapshot.iceConnectionState} pc=${snapshot.connectionState} dc=${snapshot.dataChannelState}`
+      });
     });
     peer.on("data", (data) => {
       this.emitter.emit("rtc:data", { peerId, data });
@@ -429,13 +469,17 @@ var FreeRTCClientAdapter = class {
     if (!incomingOfferSdp) return;
     let entry = this.peerEntries.get(peerId);
     if (!entry) {
+      const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
       const peer = new RtcPeer({
         initiator: false,
-        trickle: true,
+        trickleIce,
         config: this.defaultIceServers ? { iceServers: this.defaultIceServers } : void 0
       });
       this.attachPeer(peerId, peer, false);
       entry = this.peerEntries.get(peerId);
+      if (entry) {
+        entry.trickleIce = trickleIce;
+      }
     }
     const pc = entry?.connection;
     if (entry?.connected) {
@@ -563,17 +607,22 @@ var FreeRTCClientAdapter = class {
       body: { exclude_peers: [], limit: 50 }
     });
   }
-  async initiateConnection(peerId, iceServers) {
+  async initiateConnection(peerId, iceServers, trickleIce) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("Not connected");
     }
     this.closeConnection(peerId);
+    const resolvedTrickleIce = trickleIce ?? this.defaultTrickleIce;
     const peer = new RtcPeer({
       initiator: true,
-      trickle: true,
+      trickleIce: resolvedTrickleIce,
       config: iceServers ?? this.defaultIceServers ? { iceServers: iceServers ?? this.defaultIceServers ?? void 0 } : void 0
     });
     this.attachPeer(peerId, peer, true);
+    const entry = this.peerEntries.get(peerId);
+    if (entry) {
+      entry.trickleIce = resolvedTrickleIce;
+    }
   }
   nudgeSignaling() {
     this.sendEnvelope("announce", {
@@ -1149,7 +1198,8 @@ var PartialMesh = class {
       connectionTimeoutMs: config.connectionTimeoutMs ?? 45e3,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2e3,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
-      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 0
+      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 8e3,
+      trickleIce: config.trickleIce ?? true
     };
     const events = [
       "signaling:connected",
@@ -1322,7 +1372,8 @@ var PartialMesh = class {
     this.signalingClient = new freertc_client_adapter_default(signalingUrl, {
       networkId: this.config.sessionId,
       peerId: requestedPeerId,
-      iceServers: this.config.iceServers
+      iceServers: this.config.iceServers,
+      trickleIce: this.config.trickleIce
     });
     this.signalingClient.on("connected", (data) => {
       const rawClientId = data?.clientId;
@@ -1623,7 +1674,7 @@ var PartialMesh = class {
     this.peers.set(peerId, peerConnection);
     if (initiator) {
       this.signalingClient?.nudgeSignaling?.();
-      this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err) => {
+      this.signalingClient.initiateConnection(peerId, this.config.iceServers, this.config.trickleIce).catch((err) => {
         this.connecting.delete(peerId);
         this.noteDialFailure(peerId);
         const t = this.connectionTimers.get(peerId);

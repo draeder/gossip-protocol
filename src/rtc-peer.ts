@@ -4,11 +4,13 @@ type PeerEvents = {
   data: (data: any) => void;
   close: () => void;
   error: (err: any) => void;
+  debug: (snapshot: { reason: string; signalingState: string; iceConnectionState: string; connectionState: string; dataChannelState: string }) => void;
 };
 
 interface RtcPeerOptions {
   initiator: boolean;
   trickle?: boolean;
+  trickleIce?: boolean;
   config?: RTCConfiguration;
 }
 
@@ -38,7 +40,7 @@ export class RtcPeer {
   public destroyed = false;
 
   private readonly initiator: boolean;
-  private readonly trickle: boolean;
+  private readonly trickleIce: boolean;
   private readonly pc: RTCPeerConnection;
   private dc: RTCDataChannel | null = null;
   private readonly emitter = new TinyEmitter();
@@ -46,22 +48,28 @@ export class RtcPeer {
 
   constructor(options: RtcPeerOptions) {
     this.initiator = options.initiator;
-    this.trickle = options.trickle ?? true;
+    this.trickleIce = options.trickleIce ?? options.trickle ?? true;
     this.pc = new RTCPeerConnection(options.config ?? {});
 
     this.pc.onicecandidate = (event) => {
-      if (!event.candidate) {
+      if (!event.candidate || !this.trickleIce) {
         return;
       }
       this.emitter.emit('signal', { candidate: event.candidate.toJSON() });
     };
 
+    this.pc.onsignalingstatechange = () => {
+      this.emitDebugSnapshot('signalingstatechange');
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      this.emitDebugSnapshot('iceconnectionstatechange');
+    };
+
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState;
-      if (s === 'connected' && !this.connectedEmitted) {
-        this.connectedEmitted = true;
-        this.emitter.emit('connect');
-      } else if (s === 'failed' || s === 'closed' || s === 'disconnected') {
+      this.emitDebugSnapshot('connectionstatechange');
+      if (s === 'failed' || s === 'closed') {
         this.destroy();
       }
     };
@@ -74,6 +82,8 @@ export class RtcPeer {
       this.attachDataChannel(this.pc.createDataChannel('gossip'));
       this.createOffer().catch((err) => this.emitter.emit('error', err));
     }
+
+    this.emitDebugSnapshot('constructed');
   }
 
   on<K extends keyof PeerEvents>(event: K, handler: PeerEvents[K]): void {
@@ -85,11 +95,12 @@ export class RtcPeer {
 
     if (signal.type === 'offer' || signal.type === 'answer') {
       await this.pc.setRemoteDescription(new RTCSessionDescription(signal));
+      this.emitDebugSnapshot(`remote-${signal.type}`);
 
       if (signal.type === 'offer') {
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        this.emitter.emit('signal', this.pc.localDescription);
+        await this.emitLocalDescription('answer');
       }
       return;
     }
@@ -128,8 +139,10 @@ export class RtcPeer {
 
   private attachDataChannel(channel: RTCDataChannel): void {
     this.dc = channel;
+    this.emitDebugSnapshot('datachannel-attached');
 
     channel.onopen = () => {
+      this.emitDebugSnapshot('datachannel-open');
       if (!this.connectedEmitted) {
         this.connectedEmitted = true;
         this.emitter.emit('connect');
@@ -141,10 +154,12 @@ export class RtcPeer {
     };
 
     channel.onerror = (event) => {
+      this.emitDebugSnapshot('datachannel-error');
       this.emitter.emit('error', event);
     };
 
     channel.onclose = () => {
+      this.emitDebugSnapshot('datachannel-close');
       this.destroy();
     };
   }
@@ -152,12 +167,23 @@ export class RtcPeer {
   private async createOffer(): Promise<void> {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
+    await this.emitLocalDescription('offer');
+  }
 
-    if (this.trickle) {
+  private async emitLocalDescription(kind: 'offer' | 'answer'): Promise<void> {
+    if (this.trickleIce) {
       this.emitter.emit('signal', this.pc.localDescription);
+      this.emitDebugSnapshot(`local-${kind}`);
       return;
     }
 
+    await this.waitForIceGatheringComplete();
+
+    this.emitter.emit('signal', this.pc.localDescription);
+    this.emitDebugSnapshot(`local-${kind}-ice-complete`);
+  }
+
+  private async waitForIceGatheringComplete(): Promise<void> {
     await new Promise<void>((resolve) => {
       if (this.pc.iceGatheringState === 'complete') {
         resolve();
@@ -173,8 +199,16 @@ export class RtcPeer {
 
       this.pc.addEventListener('icegatheringstatechange', onIce);
     });
+  }
 
-    this.emitter.emit('signal', this.pc.localDescription);
+  private emitDebugSnapshot(reason: string): void {
+    this.emitter.emit('debug', {
+      reason,
+      signalingState: this.pc.signalingState,
+      iceConnectionState: this.pc.iceConnectionState,
+      connectionState: this.pc.connectionState,
+      dataChannelState: this.dc?.readyState ?? 'missing'
+    });
   }
 }
 

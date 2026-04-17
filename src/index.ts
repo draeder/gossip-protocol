@@ -66,6 +66,12 @@ export interface PartialMeshConfig {
    * negotiation appears within this window.
    */
   nonInitiatorFallbackDialMs?: number;
+
+  /**
+   * Whether SDP should be sent before ICE gathering completes.
+   * Disable to emit full offer/answer payloads after ICE gathering finishes.
+   */
+  trickleIce?: boolean;
 }
 
 export interface PeerConnection {
@@ -135,7 +141,8 @@ export class PartialMesh {
       connectionTimeoutMs: config.connectionTimeoutMs ?? 45_000,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
-      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 0
+      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 8_000,
+      trickleIce: config.trickleIce ?? true
     };
 
     // Initialize event handler maps
@@ -359,7 +366,8 @@ export class PartialMesh {
     this.signalingClient = new FreeRTCClientAdapter(signalingUrl, {
       networkId: this.config.sessionId,
       peerId: requestedPeerId,
-      iceServers: this.config.iceServers
+      iceServers: this.config.iceServers,
+      trickleIce: this.config.trickleIce
     });
 
     // Set up signaling event handlers
@@ -744,7 +752,7 @@ export class PartialMesh {
       // is less likely to stall when peers discover each other asymmetrically.
       this.signalingClient?.nudgeSignaling?.();
       // FreeRTC handles the full offer/answer/ICE exchange internally.
-      this.signalingClient.initiateConnection(peerId, this.config.iceServers).catch((err: any) => {
+      this.signalingClient.initiateConnection(peerId, this.config.iceServers, this.config.trickleIce).catch((err: any) => {
         this.connecting.delete(peerId);
         this.noteDialFailure(peerId);
         const t = this.connectionTimers.get(peerId);

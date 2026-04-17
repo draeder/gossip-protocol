@@ -36,6 +36,7 @@ export class FreeRTCClientAdapter {
   private readonly networkId: string;
   private readonly requestedPeerId: string;
   private readonly defaultIceServers: RTCIceServer[] | null;
+  private readonly defaultTrickleIce: boolean;
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
   private readonly pendingCandidates = new Map<string, any[]>();
@@ -53,11 +54,12 @@ export class FreeRTCClientAdapter {
   private reconnectBackoffMs = 1_000;
   private intentionallyDisconnected = false;
 
-  constructor(signalUrl: string, options?: { networkId?: string; peerId?: string; iceServers?: RTCIceServer[] | null }) {
+  constructor(signalUrl: string, options?: { networkId?: string; peerId?: string; iceServers?: RTCIceServer[] | null; trickleIce?: boolean }) {
     this.signalUrl = signalUrl;
     this.networkId = options?.networkId ?? 'default-session';
     this.requestedPeerId = options?.peerId ?? generatePeerId();
     this.defaultIceServers = options?.iceServers ?? null;
+    this.defaultTrickleIce = options?.trickleIce ?? true;
     this.addSelfAlias(this.requestedPeerId);
     this.client = {
       mesh: { connections: this.peerEntries },
@@ -288,6 +290,7 @@ export class FreeRTCClientAdapter {
     const entry: any = {
       peer,
       initiator,
+      trickleIce: this.defaultTrickleIce,
       connected: false,
       state: 'connecting',
       connection: (peer as any).pc,
@@ -301,7 +304,7 @@ export class FreeRTCClientAdapter {
       if (signal?.type === 'offer' || signal?.type === 'answer') {
         this.sendEnvelope(signal.type, {
           to: peerId,
-          body: { sdp: signal.sdp, trickle_ice: true }
+          body: { sdp: signal.sdp, trickle_ice: entry.trickleIce }
         });
       } else if (signal?.candidate) {
         this.sendEnvelope('ice_candidate', {
@@ -319,6 +322,18 @@ export class FreeRTCClientAdapter {
       current.connection = (peer as any).pc;
       current.channel = (peer as any).dc ?? null;
       this.emitter.emit('rtc:connected', { peerId });
+    });
+
+    peer.on('debug', (snapshot) => {
+      const current = this.peerEntries.get(peerId);
+      if (current) {
+        current.connection = (peer as any).pc;
+        current.channel = (peer as any).dc ?? null;
+        current.state = snapshot.connectionState;
+      }
+      this.emitter.emit('signaling:log', {
+        message: `[webrtc] ${peerId} ${snapshot.reason} signaling=${snapshot.signalingState} ice=${snapshot.iceConnectionState} pc=${snapshot.connectionState} dc=${snapshot.dataChannelState}`
+      });
     });
 
     peer.on('data', (data: any) => {
@@ -345,13 +360,17 @@ export class FreeRTCClientAdapter {
 
     let entry = this.peerEntries.get(peerId);
     if (!entry) {
+      const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
       const peer = new RtcPeer({
         initiator: false,
-        trickle: true,
+        trickleIce,
         config: this.defaultIceServers ? { iceServers: this.defaultIceServers } : undefined
       });
       this.attachPeer(peerId, peer, false);
       entry = this.peerEntries.get(peerId);
+      if (entry) {
+        entry.trickleIce = trickleIce;
+      }
     }
 
     const pc = entry?.connection as RTCPeerConnection | undefined;
@@ -504,18 +523,23 @@ export class FreeRTCClientAdapter {
     });
   }
 
-  async initiateConnection(peerId: string, iceServers?: RTCIceServer[] | null): Promise<void> {
+  async initiateConnection(peerId: string, iceServers?: RTCIceServer[] | null, trickleIce?: boolean): Promise<void> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error('Not connected');
     }
 
     this.closeConnection(peerId);
+    const resolvedTrickleIce = trickleIce ?? this.defaultTrickleIce;
     const peer = new RtcPeer({
       initiator: true,
-      trickle: true,
+      trickleIce: resolvedTrickleIce,
       config: (iceServers ?? this.defaultIceServers) ? { iceServers: iceServers ?? this.defaultIceServers ?? undefined } : undefined
     });
     this.attachPeer(peerId, peer, true);
+    const entry = this.peerEntries.get(peerId);
+    if (entry) {
+      entry.trickleIce = resolvedTrickleIce;
+    }
   }
 
   nudgeSignaling(): void {

@@ -203,6 +203,11 @@ interface PartialMeshConfig {
      * negotiation appears within this window.
      */
     nonInitiatorFallbackDialMs?: number;
+    /**
+     * Whether SDP should be sent before ICE gathering completes.
+     * Disable to emit full offer/answer payloads after ICE gathering finishes.
+     */
+    trickleIce?: boolean;
 }
 interface PeerConnection {
     id: string;
