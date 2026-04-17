@@ -1539,11 +1539,15 @@ var PartialMesh = class {
   }
   maybeRecoverStalledNegotiations() {
     const now = Date.now();
-    const stallMs = Math.max(1e4, Math.min(this.config.connectionTimeoutMs, 15e3));
+    const connectedCount = this.getConnectedPeerCount();
+    const isolated = connectedCount === 0 && this.discoveredPeers.size > 0;
+    const baseStallMs = Math.max(1e4, Math.min(this.config.connectionTimeoutMs, 15e3));
+    const stallMs = isolated ? Math.max(3500, Math.min(this.config.connectionTimeoutMs, 6e3)) : baseStallMs;
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
-      const startedAt = this.connectionStartedAtMs.get(peer.id);
-      if (!startedAt || now - startedAt < stallMs) continue;
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
+      const ageMs = Math.max(0, now - startedAt);
+      if (ageMs < stallMs) continue;
       const rtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(peer.id);
       const pc = rtcEntry?.connection;
       const signalingState = pc?.signalingState ?? "unknown";
@@ -1552,7 +1556,9 @@ var PartialMesh = class {
       const stalledOffer = signalingState === "have-local-offer" && dataState !== "open";
       const deadTransport = connectionState === "failed" || connectionState === "closed" || rtcEntry?.state === "dead";
       const noRtcProgress = !rtcEntry && this.connecting.has(peer.id);
-      if (!stalledOffer && !deadTransport && !noRtcProgress) {
+      const answeredButNoChannel = signalingState === "stable" && dataState !== "open" && connectionState !== "connected";
+      const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
+      if (!stalledOffer && !deadTransport && !noRtcProgress && !answeredButNoChannel) {
         continue;
       }
       this.noteDialFailure(peer.id);
@@ -1561,6 +1567,15 @@ var PartialMesh = class {
         error: new Error(`Negotiation stalled (${signalingState}/${connectionState}/${dataState})`)
       });
       this.removePeer(peer.id);
+      if (isolated) {
+        this.clearDialBackoff(peer.id);
+        if (this.discoveredPeers.has(peer.id)) {
+          this.connectToPeerInternal(peer.id, true);
+        }
+        if (answeredButNoChannel || repeatedlyFailing) {
+          this.maybeHardResetUnderConnected();
+        }
+      }
       return;
     }
   }
@@ -1574,15 +1589,27 @@ var PartialMesh = class {
     if (!thresholdMs || thresholdMs <= 0) return;
     const connected = this.getConnectedPeers().length;
     const pending = this.getPendingPeerCount();
+    const oldestPendingAge = this.getOldestPendingAgeMs();
     const hasEnoughCandidates = this.discoveredPeers.size >= this.config.minPeers;
+    const hasAnyCandidate = this.discoveredPeers.size > 0;
     const underConnected = connected < this.config.minPeers && hasEnoughCandidates;
+    const isolated = connected === 0 && hasAnyCandidate;
+    const isolatedThresholdMs = Math.max(3500, Math.min(thresholdMs, 8e3));
+    const hasStalePending = pending > 0 && oldestPendingAge >= isolatedThresholdMs;
+    const hasRepeatedFailures = Array.from(this.discoveredPeers).some((peerId) => (this.dialFailureCount.get(peerId) ?? 0) >= 3);
     const now = Date.now();
-    if (!underConnected) {
+    if (!underConnected && !isolated) {
       this.underConnectedSinceMs = null;
       return;
     }
+    if (isolated && (hasStalePending || hasRepeatedFailures)) {
+      if (now - this.lastHardResetAtMs < isolatedThresholdMs) {
+        return;
+      }
+      this.hardReset("isolated-stalled");
+      return;
+    }
     if (pending > 0) {
-      const oldestPendingAge = this.getOldestPendingAgeMs();
       if (oldestPendingAge < thresholdMs) {
         this.underConnectedSinceMs = null;
         return;
@@ -1608,6 +1635,9 @@ var PartialMesh = class {
   }
   noteDialSuccess(peerId) {
     this.dialFailureCount.delete(peerId);
+    this.dialBackoffUntilMs.delete(peerId);
+  }
+  clearDialBackoff(peerId) {
     this.dialBackoffUntilMs.delete(peerId);
   }
   /**
@@ -1695,11 +1725,12 @@ var PartialMesh = class {
   maintainPeerConnections() {
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
+    const emergencyIsolated = connectedCount === 0 && this.discoveredPeers.size > 0;
     const totalInProgress = connectedCount + pendingCount;
     const allCandidates = Array.from(this.discoveredPeers).filter(
       (peerId) => !this.isSelfAlias(peerId) && !this.peers.has(peerId) && !this.connecting.has(peerId)
     );
-    const available = allCandidates.filter((peerId) => !this.isPeerBackedOff(peerId));
+    const available = emergencyIsolated ? allCandidates : allCandidates.filter((peerId) => !this.isPeerBackedOff(peerId));
     const pickCandidates = (count) => {
       if (available.length === 0 && allCandidates.length === 0 || count <= 0) return [];
       const selfId = this.normalizePeerId(this.clientId);
@@ -1726,7 +1757,9 @@ var PartialMesh = class {
     };
     if (totalInProgress < this.config.minPeers) {
       const needed = this.config.minPeers - totalInProgress;
-      for (const peerId of pickCandidates(needed)) {
+      const emergencyBurst = emergencyIsolated ? Math.min(3, Math.max(2, available.length)) : 0;
+      const dialCount = emergencyIsolated ? Math.max(needed, emergencyBurst) : needed;
+      for (const peerId of pickCandidates(dialCount)) {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
@@ -1755,6 +1788,7 @@ var PartialMesh = class {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
+    const emergencyIsolated = this.getConnectedPeerCount() === 0 && this.discoveredPeers.size > 0;
     if (!signalingConnected) {
       try {
         this.signalingClient?.connect?.();
@@ -1768,8 +1802,11 @@ var PartialMesh = class {
     if (!normalizedPeerId || this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId) || this.isSelfAlias(normalizedPeerId) || normalizedPeerId === selfId) {
       return;
     }
-    if (this.isPeerBackedOff(normalizedPeerId)) {
+    if (this.isPeerBackedOff(normalizedPeerId) && !emergencyIsolated) {
       return;
+    }
+    if (emergencyIsolated) {
+      this.clearDialBackoff(normalizedPeerId);
     }
     const connectedCount = this.getConnectedPeerCount();
     const maxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.config.maxPeers;

@@ -292,6 +292,7 @@ declare class PartialMesh {
     private isPeerBackedOff;
     private noteDialFailure;
     private noteDialSuccess;
+    private clearDialBackoff;
     /**
      * Hard reset peer connections (keeps signaling + discovered peers).
      * Useful for recovering from rare stuck negotiation/ICE states.
