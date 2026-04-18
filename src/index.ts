@@ -130,7 +130,7 @@ export class PartialMesh {
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
-      signalingServer: config.signalingServer ?? 'wss://peer-ooo-worker-devtest.draeder.workers.dev/ws',
+      signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,

@@ -16,7 +16,7 @@
               :disabled="isRunning || isConnecting"
               class="input"
               data-testid="signaling-server"
-              placeholder="wss://peer-ooo-worker-devtest.draeder.workers.dev/ws"
+              placeholder="wss://peer.ooo/ws"
             />
           </label>
 
@@ -280,7 +280,7 @@ export default {
       topology: 'token-ring',
       networkName: 'gossip',
       roomSessionId: '',
-      signalingServer: 'wss://peer-ooo-worker-devtest.draeder.workers.dev/ws',
+      signalingServer: 'wss://peer.ooo/ws',
       messageLog: [],
       autoScroll: true,
       status: {
@@ -489,7 +489,7 @@ export default {
         this.reconcileTopologyWithPeerBounds();
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
-        this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer-ooo-worker-devtest.draeder.workers.dev/ws';
+        this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
         this.updateUrlState();
 
         try {
