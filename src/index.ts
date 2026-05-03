@@ -88,7 +88,10 @@ export type PartialMeshEvents = {
 export class PartialMesh {
   private config: Required<PartialMeshConfig>;
   private peers: Map<string, PeerConnection> = new Map();
-  private uniwrtcClient: any = null;
+  private ws: WebSocket | null = null;
+  private announceTimer: ReturnType<typeof setInterval> | null = null;
+  private instanceId: string | null = null;
+  private peerSessionIds: Map<string, string> = new Map();
   private discoveredPeers: Set<string> = new Set();
   private clientId: string | null = null;
   private eventHandlers: Map<keyof PartialMeshEvents, Set<Function>> = new Map();
@@ -102,7 +105,7 @@ export class PartialMesh {
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
-      signalingServer: config.signalingServer ?? 'wss://signal.peer.ooo',
+      signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
@@ -133,119 +136,170 @@ export class PartialMesh {
     return (peerId ?? '').trim();
   }
 
+  // ─── PSP helpers ────────────────────────────────────────────────────────────
+
+  private generateId(prefix = ''): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    return prefix ? `${prefix}-${hex}` : hex;
+  }
+
+  private sendPsp(type: string, body: any, to: string | null = null, sessionId: string | null = null): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const envelope = {
+      psp_version: '1.0',
+      type,
+      network: this.config.sessionId,
+      from: this.clientId,
+      to,
+      session_id: sessionId,
+      message_id: this.generateId('msg'),
+      timestamp: Date.now(),
+      ttl_ms: 30000,
+      body
+    };
+    this.ws.send(JSON.stringify(envelope));
+  }
+
+  private sendAnnounce(): void {
+    this.sendPsp('announce', {
+      instance_id: this.instanceId,
+      roles: ['peer'],
+      capabilities: { trickle_ice: true, restart_ice: false, datachannel: true, media: false },
+      hints: {
+        max_peers: this.config.maxPeers,
+        connected_peers: this.getConnectedPeers().length,
+        wants_peers: this.peers.size < this.config.maxPeers
+      }
+    });
+  }
+
+  private sendDiscover(): void {
+    this.sendPsp('discover', { want_roles: ['peer'], limit: 16 });
+  }
+
+  private handlePspMessage(msg: any): void {
+    if (!msg || !msg.type) return;
+    // Reject messages not for our network
+    if (msg.network && msg.network !== this.config.sessionId) return;
+
+    const selfId = this.normalizePeerId(this.clientId);
+    const fromId = this.normalizePeerId(msg.from);
+
+    switch (msg.type) {
+      case 'announce': {
+        if (!fromId || fromId === selfId || fromId === 'bootstrap-relay') break;
+        if (!this.discoveredPeers.has(fromId)) {
+          this.discoveredPeers.add(fromId);
+          this.emit('peer:discovered', fromId);
+          if (this.config.autoConnect) this.maintainPeerConnections();
+        }
+        break;
+      }
+      case 'peer_list': {
+        const peers: any[] = msg.body?.peers ?? [];
+        peers.forEach((p: any) => {
+          const peerId = this.normalizePeerId(p.peer_id);
+          if (peerId && peerId !== selfId && !this.discoveredPeers.has(peerId)) {
+            this.discoveredPeers.add(peerId);
+            this.emit('peer:discovered', peerId);
+          }
+        });
+        if (peers.length > 0 && this.config.autoConnect) this.maintainPeerConnections();
+        break;
+      }
+      case 'withdraw':
+      case 'bye': {
+        if (!fromId || fromId === selfId) break;
+        this.discoveredPeers.delete(fromId);
+        this.removePeer(fromId, true);
+        break;
+      }
+      case 'offer': {
+        if (!fromId || fromId === selfId) break;
+        const sessionId = msg.session_id;
+        if (sessionId) this.peerSessionIds.set(fromId, sessionId);
+        this.handleOffer(fromId, { type: 'offer', sdp: msg.body?.sdp });
+        // Re-announce immediately to flush any additional queued messages (e.g. ICE candidates)
+        this.sendAnnounce();
+        break;
+      }
+      case 'answer': {
+        if (!fromId || fromId === selfId) break;
+        this.handleAnswer(fromId, { type: 'answer', sdp: msg.body?.sdp });
+        this.sendAnnounce();
+        break;
+      }
+      case 'ice_candidate': {
+        if (!fromId || fromId === selfId) break;
+        this.handleIceCandidate(fromId, msg.body?.candidate);
+        this.sendAnnounce();
+        break;
+      }
+      case 'error': {
+        // ignore relay errors (e.g. unknown_peer for stale sessions)
+        break;
+      }
+    }
+  }
+
+  // ─── Init ────────────────────────────────────────────────────────────────────
+
   /**
    * Initialize and connect to the signaling server
    */
   async init(): Promise<void> {
-    // Dynamically import UniWRTC client
-    const { default: UniWRTCClient } = await import('uniwrtc/client-browser.js');
+    // Generate stable peer identity for this session.
+    this.clientId = this.generateId();
+    this.instanceId = this.generateId('inst');
 
-    // UniWRTC's Cloudflare deployment (signal.peer.ooo) uses a Worker route that upgrades
-    // WebSocket connections on `/ws` and routes by `?room=`.
-    // Expected form: `wss://signal.peer.ooo/ws?room=<sessionId>`
-    let signalingUrl = this.config.signalingServer;
-    if (signalingUrl.includes('signal.peer.ooo')) {
-      const url = new URL(signalingUrl);
+    // Normalize scheme: https→wss, http→ws.
+    const rawUrl = this.config.signalingServer;
+    const signalingUrl = rawUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
 
-      // Normalize scheme to ws/wss if user provided http/https.
-      if (url.protocol === 'https:') url.protocol = 'wss:';
-      if (url.protocol === 'http:') url.protocol = 'ws:';
+    return new Promise<void>((resolve, reject) => {
+      this.ws = new WebSocket(signalingUrl);
 
-      // Normalize path to /ws (Cloudflare Worker expects this endpoint).
-      const normalizedPath = url.pathname.replace(/\/+$/, '');
-      if (normalizedPath === '' || normalizedPath === '/') {
-        url.pathname = '/ws';
-      } else if (normalizedPath !== '/ws') {
-        // If a different path was supplied, prefer /ws for signal.peer.ooo.
-        url.pathname = '/ws';
-      }
+      this.ws.onopen = () => {
+        this.emit('signaling:connected', { clientId: this.clientId! });
+        this.sendAnnounce();
+        this.sendDiscover();
 
-      // Ensure room param exists.
-      if (!url.searchParams.get('room')) {
-        url.searchParams.set('room', this.config.sessionId);
-      }
-
-      signalingUrl = url.toString();
-    }
-
-    this.uniwrtcClient = new UniWRTCClient(signalingUrl, {
-      autoReconnect: true,
-      reconnectDelay: 3000
-    });
-
-    // Set up UniWRTC event handlers
-    this.uniwrtcClient.on('connected', (data: { clientId: string }) => {
-      const rawClientId = data?.clientId;
-      this.clientId = this.normalizePeerId(rawClientId);
-      this.emit('signaling:connected', { clientId: this.clientId, rawClientId });
-      
-      if (this.config.autoDiscover) {
-        this.uniwrtcClient.joinSession(this.config.sessionId);
-      }
-
-      if (this.config.autoConnect) {
-        this.startMaintenanceLoop();
-      }
-    });
-
-    this.uniwrtcClient.on('disconnected', () => {
-      this.emit('signaling:disconnected');
-    });
-
-    this.uniwrtcClient.on('joined', (data: { sessionId: string; clients: string[] }) => {
-      // Add existing peers to discovered list
-      const selfId = this.normalizePeerId(this.clientId);
-      data.clients.forEach((rawPeerId: string) => {
-        const peerId = this.normalizePeerId(rawPeerId);
-        if (peerId && peerId !== selfId) {
-          this.discoveredPeers.add(peerId);
-          this.emit('peer:discovered', peerId);
+        if (this.config.autoDiscover) {
+          // Periodically re-announce — this flushes queued relay messages (peer.ooo stores
+          // directed messages in D1 and delivers them on the recipient's next announce).
+          if (this.announceTimer) clearInterval(this.announceTimer);
+          this.announceTimer = setInterval(() => {
+            this.sendAnnounce();
+            this.sendDiscover();
+          }, 1_000);
         }
-      });
 
-      if (this.config.autoConnect) {
-        this.maintainPeerConnections();
-      }
-    });
-
-    this.uniwrtcClient.on('peer-joined', (data: { peerId: string }) => {
-      const selfId = this.normalizePeerId(this.clientId);
-      const peerId = this.normalizePeerId(data.peerId);
-      if (peerId && peerId !== selfId) {
-        this.discoveredPeers.add(peerId);
-        this.emit('peer:discovered', peerId);
-        
         if (this.config.autoConnect) {
-          this.maintainPeerConnections();
+          this.startMaintenanceLoop();
         }
-      }
-    });
 
-    this.uniwrtcClient.on('peer-left', (data: { peerId: string }) => {
-      const peerId = this.normalizePeerId(data.peerId);
-      if (!peerId) return;
-      this.discoveredPeers.delete(peerId);
-      this.removePeer(peerId, true);
-    });
+        resolve();
+      };
 
-    this.uniwrtcClient.on('offer', async (data: { peerId: string; offer: RTCSessionDescriptionInit }) => {
-      await this.handleOffer(data.peerId, data.offer);
-    });
+      this.ws.onmessage = (event: MessageEvent) => {
+        try {
+          this.handlePspMessage(JSON.parse(event.data as string));
+        } catch {
+          // ignore malformed messages
+        }
+      };
 
-    this.uniwrtcClient.on('answer', async (data: { peerId: string; answer: RTCSessionDescriptionInit }) => {
-      await this.handleAnswer(data.peerId, data.answer);
-    });
+      this.ws.onclose = () => {
+        this.emit('signaling:disconnected');
+      };
 
-    this.uniwrtcClient.on('ice-candidate', async (data: { peerId: string; candidate: RTCIceCandidateInit }) => {
-      await this.handleIceCandidate(data.peerId, data.candidate);
+      this.ws.onerror = (error: Event) => {
+        this.emit('signaling:error', error);
+        reject(error);
+      };
     });
-
-    this.uniwrtcClient.on('error', (error: any) => {
-      this.emit('signaling:error', error);
-    });
-
-    // Connect to the signaling server
-    await this.uniwrtcClient.connect();
   }
 
   private startMaintenanceLoop(): void {
@@ -313,11 +367,10 @@ export class PartialMesh {
     this.peers.clear();
     this.connecting.clear();
 
-    // Re-announce/join to refresh discovery state in the signaling layer.
+    // Re-announce to refresh discovery state in the signaling layer.
     try {
-      if (this.uniwrtcClient && this.config.sessionId) {
-        this.uniwrtcClient.joinSession(this.config.sessionId);
-      }
+      this.sendAnnounce();
+      this.sendDiscover();
     } catch {
       // ignore
     }
@@ -454,14 +507,18 @@ export class PartialMesh {
     this.connectionTimers.set(peerId, timer);
 
     peer.on('signal', (signal: any) => {
-      // Send signal through UniWRTC
+      // Send signal through PSP
+      const sessionId = this.peerSessionIds.get(peerId) ?? this.generateId('sess');
+      this.peerSessionIds.set(peerId, sessionId);
       if (signal.type === 'offer') {
-        this.uniwrtcClient.sendOffer(signal, peerId);
+        this.sendPsp('offer', { sdp: signal.sdp, trickle_ice: true }, peerId, sessionId);
       } else if (signal.type === 'answer') {
-        this.uniwrtcClient.sendAnswer(signal, peerId);
+        this.sendPsp('answer', { sdp: signal.sdp, trickle_ice: true }, peerId, sessionId);
       } else if (signal.candidate) {
-        this.uniwrtcClient.sendIceCandidate(signal.candidate, peerId);
+        this.sendPsp('ice_candidate', { candidate: signal.candidate }, peerId, sessionId);
       }
+      // Re-announce immediately so the other side receives any queued replies on their next announce
+      this.sendAnnounce();
     });
 
     peer.on('connect', () => {
@@ -737,13 +794,21 @@ export class PartialMesh {
     this.connecting.clear();
     this.discoveredPeers.clear();
     this.clientId = null;
+    this.instanceId = null;
+    this.peerSessionIds.clear();
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
 
+    // Stop periodic announce
+    if (this.announceTimer) {
+      clearInterval(this.announceTimer);
+      this.announceTimer = null;
+    }
+
     // Disconnect from signaling server
-    if (this.uniwrtcClient) {
-      this.uniwrtcClient.disconnect();
-      this.uniwrtcClient = null;
+    if (this.ws) {
+      try { this.ws.close(); } catch { /* ignore */ }
+      this.ws = null;
     }
   }
 }
