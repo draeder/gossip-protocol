@@ -218,7 +218,7 @@ export default {
       replayOnReconnectCount: 3,
       sessionId: 'gossip-protocol-demo-local',
       roomId: 'gossip-protocol-demo-local',
-      maxPeersTolerance: 2,
+      maxPeersTolerance: 1,
       underConnectedResetMs: 15000,
       connectionTimeoutMs: 12000,
       hadSignalingConnection: false,
@@ -271,14 +271,20 @@ export default {
       this.roomId = roomIdParam;
     }
 
-    const maxPeersToleranceParam = Number(params.get('maxPeersTolerance'));
-    if (Number.isFinite(maxPeersToleranceParam) && maxPeersToleranceParam >= 0) {
-      this.maxPeersTolerance = Math.min(50, Math.floor(maxPeersToleranceParam));
+    const maxPeersToleranceRaw = params.get('maxPeersTolerance');
+    if (maxPeersToleranceRaw !== null) {
+      const maxPeersToleranceParam = Number(maxPeersToleranceRaw);
+      if (Number.isFinite(maxPeersToleranceParam) && maxPeersToleranceParam >= 0) {
+        this.maxPeersTolerance = Math.min(50, Math.floor(maxPeersToleranceParam));
+      }
     }
 
-    const tolerableOverMaxParam = Number(params.get('tolerableOverMax'));
-    if (Number.isFinite(tolerableOverMaxParam) && tolerableOverMaxParam >= 0) {
-      this.maxPeersTolerance = Math.min(50, Math.floor(tolerableOverMaxParam));
+    const tolerableOverMaxRaw = params.get('tolerableOverMax');
+    if (tolerableOverMaxRaw !== null) {
+      const tolerableOverMaxParam = Number(tolerableOverMaxRaw);
+      if (Number.isFinite(tolerableOverMaxParam) && tolerableOverMaxParam >= 0) {
+        this.maxPeersTolerance = Math.min(50, Math.floor(tolerableOverMaxParam));
+      }
     }
 
     const maxHopsParam = Number(params.get('maxHops'));

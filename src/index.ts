@@ -193,7 +193,7 @@ export class PartialMesh {
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
-      maxPeersTolerance: Math.max(0, Math.floor(config.maxPeersTolerance ?? 0)),
+      maxPeersTolerance: Math.max(0, Math.floor(config.maxPeersTolerance ?? 1)),
       signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
@@ -1065,8 +1065,10 @@ export class PartialMesh {
         this.connectToPeer(sorted[i]);
       }
     } else if (currentPeerCount > this.getHardMaxPeers()) {
-      // Too many connections beyond soft max — drop the farthest peers first.
-      const toDrop = currentPeerCount - this.getHardMaxPeers();
+      // Hard ceiling exceeded — rebalance back to maxPeers (the clean target).
+      // Tolerance absorbs inbound connection spikes; this drops farthest peers
+      // only when the hard ceiling is actually breached.
+      const toDrop = currentPeerCount - this.config.maxPeers;
       const peerIds = selfId
         ? this.getConnectedPeers().slice().sort((a, b) => {
             const da = this.xorDistance(selfId, a);
