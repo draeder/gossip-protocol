@@ -236,6 +236,13 @@ export class PartialMesh {
     return (peerId ?? '').trim();
   }
 
+  private isConnectablePeerId(peerId: string, selfId: string): boolean {
+    if (!peerId || peerId === selfId) return false;
+    // Signaling system identifiers are not dialable WebRTC peers.
+    if (peerId === 'bootstrap-relay') return false;
+    return true;
+  }
+
   // ─── PSP helpers ────────────────────────────────────────────────────────────
 
   private generateId(prefix = ''): string {
@@ -449,6 +456,17 @@ export class PartialMesh {
     return Date.now() >= state.nextAttemptAtMs;
   }
 
+  private deferPeerReconnect(peerId: string, delayMs: number): void {
+    if (!peerId) return;
+    const delay = Math.max(0, Math.floor(delayMs));
+    const prev = this.peerReconnectState.get(peerId);
+    const attempts = Math.max(1, prev?.attempts ?? 0);
+    this.peerReconnectState.set(peerId, {
+      attempts,
+      nextAttemptAtMs: Date.now() + delay
+    });
+  }
+
   private clearReconnectTimer(): void {
     if (!this.reconnectTimer) return;
     clearTimeout(this.reconnectTimer);
@@ -639,7 +657,7 @@ export class PartialMesh {
 
     switch (msg.type) {
       case 'announce': {
-        if (!fromId || fromId === selfId || fromId === 'bootstrap-relay') break;
+        if (!this.isConnectablePeerId(fromId, selfId)) break;
         if (!this.discoveredPeers.has(fromId)) {
           this.discoveredPeers.add(fromId);
           // Clear backoff when we see a fresh announcement; network conditions may have improved
@@ -653,7 +671,7 @@ export class PartialMesh {
         const peers: any[] = msg.body?.peers ?? [];
         peers.forEach((p: any) => {
           const peerId = this.normalizePeerId(p.peer_id);
-          if (peerId && peerId !== selfId && !this.discoveredPeers.has(peerId)) {
+          if (this.isConnectablePeerId(peerId, selfId) && !this.discoveredPeers.has(peerId)) {
             this.discoveredPeers.add(peerId);
             // Clear backoff when we discover a peer; network conditions may have improved
             this.clearPeerConnectFailure(peerId);
@@ -842,6 +860,9 @@ export class PartialMesh {
 
     // Soft max admission control for new inbound peers.
     if (!peerConnection) {
+      if (!this.canAttemptPeerConnect(normalizedPeerId)) {
+        return;
+      }
       const hardMaxPeers = this.getHardMaxPeers();
       if (this.getConnectedPeers().length + this.connecting.size >= hardMaxPeers) {
         return;
@@ -1035,7 +1056,7 @@ export class PartialMesh {
    * organises into a Kademlia-like topology — nearby peers connect first.
    */
   private maintainPeerConnections(): void {
-    if (!this.isSignalingOpen()) return;
+    const signalingOpen = this.isSignalingOpen();
 
     const selfId = this.normalizePeerId(this.clientId);
     const currentPeerCount = this.getConnectedPeers().length;
@@ -1043,6 +1064,7 @@ export class PartialMesh {
     const totalInProgress = currentPeerCount + connectingCount;
 
     if (totalInProgress < this.config.maxPeers) {
+      if (!signalingOpen) return;
       // Need more connections — fill up to maxPeers, not just minPeers,
       // so that later-joining peers can always get connections from already-connected ones.
       const needed = this.config.maxPeers - totalInProgress;
@@ -1064,10 +1086,10 @@ export class PartialMesh {
       for (let i = 0; i < Math.min(needed, sorted.length); i++) {
         this.connectToPeer(sorted[i]);
       }
-    } else if (currentPeerCount > this.getHardMaxPeers()) {
-      // Hard ceiling exceeded — rebalance back to maxPeers (the clean target).
-      // Tolerance absorbs inbound connection spikes; this drops farthest peers
-      // only when the hard ceiling is actually breached.
+    } else if (currentPeerCount > this.config.maxPeers) {
+      // Rebalance back to maxPeers (the clean target).
+      // maxPeersTolerance absorbs short inbound spikes, but the periodic
+      // maintenance pass should still converge back to maxPeers.
       const toDrop = currentPeerCount - this.config.maxPeers;
       const peerIds = selfId
         ? this.getConnectedPeers().slice().sort((a, b) => {
@@ -1078,7 +1100,10 @@ export class PartialMesh {
         : this.getConnectedPeers();
 
       for (let i = 0; i < toDrop; i++) {
-        this.disconnectFromPeer(peerIds[i]);
+        const peerId = peerIds[i];
+        // Prevent immediate reconnect thrash after overflow trimming.
+        this.deferPeerReconnect(peerId, 5000);
+        this.disconnectFromPeer(peerId);
       }
     }
   }

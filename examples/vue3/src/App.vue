@@ -112,7 +112,7 @@
         </div>
         <div class="stat-box">
           <span class="label">Connected Remote Peers:</span>
-          <span class="value" data-testid="connected-peers">{{ connectedPeers }} / {{ maxPeers }} (+{{ maxPeersTolerance }})</span>
+          <span class="value" data-testid="connected-peers">{{ connectedPeers }} / {{ maxPeers }} (+{{ toleratedConnectedPeers }})</span>
         </div>
         <div class="stat-box">
           <span class="label">Discovered Remote Peers:</span>
@@ -319,6 +319,9 @@ export default {
   computed: {
     connectedPeers() {
       return this.connectedPeersList.length;
+    },
+    toleratedConnectedPeers() {
+      return Math.max(0, this.connectedPeers - this.maxPeers);
     },
     discoveredPeers() {
       return this.discoveredPeersList.length;
