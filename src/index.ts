@@ -11,6 +11,13 @@ export interface PartialMeshConfig {
    * Maximum number of peers to maintain connections with
    */
   maxPeers?: number;
+
+  /**
+   * Soft-max overflow allowance above maxPeers.
+   * Example: maxPeers=5 and maxPeersTolerance=2 allows up to 7 connected peers
+   * before trimming starts.
+   */
+  maxPeersTolerance?: number;
   
   /**
    * UniWRTC signaling server URL
@@ -59,6 +66,50 @@ export interface PartialMeshConfig {
    * This helps recover from rare stuck negotiation/ICE states in some browsers.
    */
   underConnectedResetMs?: number;
+
+  /**
+   * How often to re-announce and re-discover on the signaling server (ms).
+   * Lower values speed up peer discovery but increase CPU/network load.
+   * Default: 3000.
+   */
+  announceIntervalMs?: number;
+
+  /**
+   * Debounce announce messages triggered by offer/answer/ICE signal bursts.
+   * Reduces CPU/network overhead during negotiation.
+   */
+  debounceSignalAnnounce?: boolean;
+
+  /**
+   * Debounce delay for signal-triggered announce messages.
+   */
+  announceDebounceMs?: number;
+
+  /**
+   * Timeout for establishing signaling websocket connection (ms).
+   * If exceeded, the socket is closed and reconnect backoff is applied.
+   */
+  signalingConnectTimeoutMs?: number;
+
+  /**
+   * Automatically reconnect signaling websocket when it closes unexpectedly.
+   */
+  signalingAutoReconnect?: boolean;
+
+  /**
+   * Base delay for signaling reconnect backoff (ms).
+   */
+  signalingReconnectBaseMs?: number;
+
+  /**
+   * Max delay for signaling reconnect backoff (ms).
+   */
+  signalingReconnectMaxMs?: number;
+
+  /**
+   * Pause signaling polling and reconnect attempts while tab is hidden.
+   */
+  pauseWhenHidden?: boolean;
 }
 
 export interface PeerConnection {
@@ -100,21 +151,70 @@ export class PartialMesh {
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   private underConnectedSinceMs: number | null = null;
   private lastHardResetAtMs: number = 0;
+  private announceDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts: number = 0;
+  private signalingUrl: string | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private initialConnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private hasSignalingConnectedOnce: boolean = false;
+  private destroyed: boolean = false;
+  private lifecycleListenersBound: boolean = false;
+  private peerReconnectState: Map<string, { attempts: number; nextAttemptAtMs: number }> = new Map();
+  private readonly handleVisibilityChange = (): void => {
+    if (typeof document !== 'undefined') {
+      if (document.visibilityState === 'visible') {
+        // Tab became visible: reset clocks and recover connections
+        this.resetConnectionTimers();
+        this.underConnectedSinceMs = null;
+        this.recoverSignaling('visibility');
+        if (this.config.autoConnect) {
+          this.maintainPeerConnections();
+        }
+      } else {
+        // Don't accumulate under-connected wall-clock time while hidden.
+        // Browser background throttling can make this look like persistent failure.
+        this.underConnectedSinceMs = null;
+      }
+      // Don't hard reset on hide — aggressive timers keep connections alive in background tabs
+    }
+  };
+  private readonly handleOnline = (): void => {
+    this.recoverSignaling('online');
+  };
+  private readonly handlePageShow = (): void => {
+    // pageshow fires on initial load too; avoid racing initial connect with
+    // an immediate recovery attempt.
+    if (!this.hasSignalingConnectedOnce) return;
+    this.recoverSignaling('pageshow');
+  };
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
+      maxPeersTolerance: Math.max(0, Math.floor(config.maxPeersTolerance ?? 0)),
       signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
       iceServers: config.iceServers ?? [
-        { urls: 'stun:stun.l.google.com:19302' }
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' }
       ],
-      connectionTimeoutMs: config.connectionTimeoutMs ?? 25_000,
+      connectionTimeoutMs: config.connectionTimeoutMs ?? 12_000,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2_000,
-      underConnectedResetMs: config.underConnectedResetMs ?? 0
+      underConnectedResetMs: config.underConnectedResetMs ?? 0,
+      announceIntervalMs: config.announceIntervalMs ?? 1_000,
+      debounceSignalAnnounce: config.debounceSignalAnnounce ?? true,
+      announceDebounceMs: config.announceDebounceMs ?? 150,
+      signalingConnectTimeoutMs: config.signalingConnectTimeoutMs ?? 8_000,
+      signalingAutoReconnect: config.signalingAutoReconnect ?? true,
+      signalingReconnectBaseMs: config.signalingReconnectBaseMs ?? 2_500,
+      signalingReconnectMaxMs: config.signalingReconnectMaxMs ?? 30_000,
+      pauseWhenHidden: config.pauseWhenHidden ?? false
     };
 
     // Initialize event handler maps
@@ -145,6 +245,23 @@ export class PartialMesh {
     return prefix ? `${prefix}-${hex}` : hex;
   }
 
+  private getOrCreateClientId(): string {
+    const fallback = this.generateId();
+    if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
+      return fallback;
+    }
+
+    const key = `partialmesh:clientId:${this.config.sessionId}`;
+    try {
+      const existing = (window.sessionStorage.getItem(key) ?? '').trim();
+      if (existing) return existing;
+      window.sessionStorage.setItem(key, fallback);
+      return fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   private sendPsp(type: string, body: any, to: string | null = null, sessionId: string | null = null): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const envelope = {
@@ -163,20 +280,353 @@ export class PartialMesh {
   }
 
   private sendAnnounce(): void {
+    const hardMaxPeers = this.getHardMaxPeers();
     this.sendPsp('announce', {
       instance_id: this.instanceId,
       roles: ['peer'],
       capabilities: { trickle_ice: true, restart_ice: false, datachannel: true, media: false },
       hints: {
-        max_peers: this.config.maxPeers,
+        max_peers: hardMaxPeers,
         connected_peers: this.getConnectedPeers().length,
-        wants_peers: this.peers.size < this.config.maxPeers
+        wants_peers: this.peers.size < hardMaxPeers
       }
     });
   }
 
+  private getHardMaxPeers(): number {
+    return this.config.maxPeers + this.config.maxPeersTolerance;
+  }
+
+  /**
+   * Debounced version of sendAnnounce. Collapses rapid bursts of ICE signals into
+   * a single announce, preventing CPU spikes during WebRTC negotiation.
+   */
+  private debouncedAnnounce(): void {
+    const debounceMs = Number.isFinite(this.config.announceDebounceMs)
+      ? Math.max(0, Math.floor(this.config.announceDebounceMs))
+      : 150;
+
+    if (!this.config.debounceSignalAnnounce || debounceMs <= 0) {
+      if (this.announceDebounceTimer) {
+        clearTimeout(this.announceDebounceTimer);
+        this.announceDebounceTimer = null;
+      }
+      this.sendAnnounce();
+      return;
+    }
+
+    if (this.announceDebounceTimer) clearTimeout(this.announceDebounceTimer);
+    this.announceDebounceTimer = setTimeout(() => {
+      this.announceDebounceTimer = null;
+      this.sendAnnounce();
+    }, debounceMs);
+  }
+
   private sendDiscover(): void {
-    this.sendPsp('discover', { want_roles: ['peer'], limit: 16 });
+    // Ask for maxPeers plus a logarithmic slack set to absorb churn/failed dials
+    // without scaling discovery load linearly with mesh size.
+    const maxPeers = Math.max(1, this.config.maxPeers);
+    const logSlack = Math.ceil(10 * Math.log2(maxPeers + 1));
+    const limit = Math.max(8, Math.min(5000, maxPeers + logSlack));
+    this.sendPsp('discover', { want_roles: ['peer'], limit });
+  }
+
+  private isPausedByVisibility(): boolean {
+    if (!this.config.pauseWhenHidden) return false;
+    if (typeof document === 'undefined') return false;
+    return document.visibilityState === 'hidden';
+  }
+
+  private isDocumentHidden(): boolean {
+    if (typeof document === 'undefined') return false;
+    return document.visibilityState === 'hidden';
+  }
+
+  private armConnectionTimeout(peerId: string): void {
+    const existing = this.connectionTimers.get(peerId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+
+    const timer = setTimeout(() => {
+      const current = this.peers.get(peerId);
+      if (!current || current.connected) return;
+      if (current.peer.destroyed) return;
+
+      // Browser timer throttling in background tabs can delay/cluster callbacks.
+      // Defer timeout enforcement until the tab is visible again to avoid churn.
+      if (this.isDocumentHidden()) {
+        this.armConnectionTimeout(peerId);
+        return;
+      }
+
+      this.connecting.delete(peerId);
+      this.notePeerConnectFailure(peerId);
+      this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
+      try {
+        current.peer.destroy();
+      } catch {
+        // ignore
+      }
+      this.removePeer(peerId);
+    }, this.config.connectionTimeoutMs);
+
+    this.connectionTimers.set(peerId, timer);
+  }
+
+  private bindLifecycleListeners(): void {
+    if (this.lifecycleListenersBound) return;
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this.handleOnline);
+      window.addEventListener('pageshow', this.handlePageShow);
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.lifecycleListenersBound = true;
+  }
+
+  private unbindLifecycleListeners(): void {
+    if (!this.lifecycleListenersBound) return;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this.handleOnline);
+      window.removeEventListener('pageshow', this.handlePageShow);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.lifecycleListenersBound = false;
+  }
+
+  private getSignalingState(): number {
+    return this.ws ? this.ws.readyState : WebSocket.CLOSED;
+  }
+
+  private isSignalingOpen(): boolean {
+    return this.getSignalingState() === WebSocket.OPEN;
+  }
+
+  /**
+   * Restart connection timeout timers for all in-flight (not yet connected) peers.
+   * Called on tab wakeup so timers that fired during suspension don't falsely tear
+   * down connections that are still negotiating.
+   */
+  private resetConnectionTimers(): void {
+    for (const [peerId, t] of Array.from(this.connectionTimers.entries())) {
+      const pc = this.peers.get(peerId);
+      if (!pc || pc.connected) {
+        // Already connected or gone — timer is stale, clean it up.
+        clearTimeout(t);
+        this.connectionTimers.delete(peerId);
+        continue;
+      }
+      // Restart timeout with the full budget from now.
+      this.armConnectionTimeout(peerId);
+    }
+  }
+
+  private notePeerConnectFailure(peerId: string): void {
+    const prev = this.peerReconnectState.get(peerId);
+    const attempts = (prev?.attempts ?? 0) + 1;
+    // Retry faster while under-connected, slower once mesh is healthy.
+    const underConnected = this.getConnectedPeers().length < this.config.minPeers;
+    const base = underConnected ? 250 : 1_000;
+    const max = underConnected ? 2_000 : 30_000;
+    const delay = Math.min(max, base * Math.pow(2, Math.min(attempts - 1, 6)));
+    this.peerReconnectState.set(peerId, {
+      attempts,
+      nextAttemptAtMs: Date.now() + delay
+    });
+  }
+
+  private clearPeerConnectFailure(peerId: string): void {
+    this.peerReconnectState.delete(peerId);
+  }
+
+  private canAttemptPeerConnect(peerId: string): boolean {
+    const state = this.peerReconnectState.get(peerId);
+    if (!state) return true;
+    return Date.now() >= state.nextAttemptAtMs;
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private startAnnounceLoop(): void {
+    if (!this.config.autoDiscover) return;
+    if (this.announceTimer) clearInterval(this.announceTimer);
+    this.announceTimer = setInterval(() => {
+      this.sendAnnounce();
+      this.sendDiscover();
+    }, this.config.announceIntervalMs);
+  }
+
+  private stopAnnounceLoop(): void {
+    if (!this.announceTimer) return;
+    clearInterval(this.announceTimer);
+    this.announceTimer = null;
+  }
+
+  private startHeartbeat(socket: WebSocket): void {
+    this.stopHeartbeat();
+    // Send a keepalive announce every 20 s so the server doesn't close the idle connection.
+    // Most WebSocket proxies / servers have a 30–60 s idle timeout.
+    this.heartbeatTimer = setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        this.stopHeartbeat();
+        return;
+      }
+      try { this.sendAnnounce(); } catch { /* ignore */ }
+    }, 20_000);
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) return;
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  private scheduleReconnect(reason: string): void {
+    if (this.destroyed || !this.config.signalingAutoReconnect) return;
+    if (this.reconnectTimer) return;
+
+    const base = Math.max(250, this.config.signalingReconnectBaseMs);
+    const max = Math.max(base, this.config.signalingReconnectMaxMs);
+    const attempt = this.reconnectAttempts;
+    const jitterFactor = 0.8 + Math.random() * 0.4;
+    const delay = Math.floor(Math.min(max, base * Math.pow(2, Math.min(attempt, 8)) * jitterFactor));
+
+    this.reconnectAttempts = attempt + 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connectSignaling();
+    }, delay);
+
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(`[PartialMesh] scheduling signaling reconnect in ${delay}ms (${reason})`);
+    } catch {
+      // ignore
+    }
+  }
+
+  private recoverSignaling(reason: string): void {
+    if (this.destroyed || !this.config.signalingAutoReconnect) return;
+    if (this.isPausedByVisibility()) return;
+    const state = this.getSignalingState();
+    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+
+    this.clearReconnectTimer();
+    this.reconnectAttempts = 0;
+    this.connectSignaling();
+
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(`[PartialMesh] attempting signaling recovery (${reason})`);
+    } catch {
+      // ignore
+    }
+  }
+
+  private connectSignaling(): void {
+    if (this.destroyed || !this.signalingUrl) return;
+
+    const state = this.getSignalingState();
+    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+
+    const socket = new WebSocket(this.signalingUrl);
+    this.ws = socket;
+    let opened = false;
+    const openTimeout = setTimeout(() => {
+      if (opened) return;
+      if (this.ws !== socket) return;
+      if (socket.readyState === WebSocket.CONNECTING) {
+        try { socket.close(); } catch { /* ignore */ }
+      }
+    }, Math.max(1_000, this.config.signalingConnectTimeoutMs));
+
+    socket.onopen = () => {
+      opened = true;
+      clearTimeout(openTimeout);
+      this.reconnectAttempts = 0;
+      this.hasSignalingConnectedOnce = true;
+      this.clearReconnectTimer();
+      this.emit('signaling:connected', { clientId: this.clientId! });
+
+      // Any peer handshakes that were in-flight when the WS was down are dead.
+      // Clear them so maintainPeerConnections can retry immediately.
+      for (const peerId of Array.from(this.connecting)) {
+        const pc = this.peers.get(peerId);
+        if (pc && !pc.connected) {
+          try { pc.peer.destroy(); } catch { /* ignore */ }
+          this.peers.delete(peerId);
+        }
+        this.connecting.delete(peerId);
+      }
+
+      this.sendAnnounce();
+      this.sendDiscover();
+      this.startAnnounceLoop();
+
+      if (this.config.autoConnect) {
+        this.startMaintenanceLoop();
+        this.maintainPeerConnections();
+      }
+      // Clear per-peer backoff state so all discovered peers can be retried
+      // immediately after a signaling reconnect (new WS = fresh network conditions).
+      this.peerReconnectState.clear();
+
+      // Send a periodic keepalive announce so the server doesn't close the idle WS.
+      this.startHeartbeat(socket);
+    };
+
+    socket.onmessage = (event: MessageEvent) => {
+      try {
+        this.handlePspMessage(JSON.parse(event.data as string));
+      } catch {
+        // ignore malformed messages
+      }
+    };
+
+    socket.onclose = () => {
+      clearTimeout(openTimeout);
+      if (this.ws === socket) this.ws = null;
+      this.stopAnnounceLoop();
+      this.emit('signaling:disconnected');
+
+      this.stopHeartbeat();
+      this.scheduleReconnect('close');
+    };
+
+    socket.onerror = (errorEvent: Event) => {
+      const ws = errorEvent.target as WebSocket | null;
+      const message = ws
+        ? `WebSocket signaling error (readyState=${ws.readyState})`
+        : 'WebSocket signaling error';
+      const error = new Error(message);
+      this.emit('signaling:error', error);
+
+      // Some browser/network stacks surface websocket failures as error without
+      // a reliable close callback. Ensure reconnect is always scheduled.
+      if (this.ws === socket && socket.readyState === WebSocket.CONNECTING) {
+        try { socket.close(); } catch { /* ignore */ }
+        // If the browser never delivers close(), force cleanup so future
+        // connectSignaling() calls are not blocked by a stale CONNECTING socket.
+        setTimeout(() => {
+          if (this.ws !== socket) return;
+          if (socket.readyState === WebSocket.CONNECTING) {
+            try { socket.close(); } catch { /* ignore */ }
+            this.ws = null;
+            this.scheduleReconnect('error-timeout');
+          }
+        }, 1_000);
+      }
+      this.scheduleReconnect('error');
+
+    };
   }
 
   private handlePspMessage(msg: any): void {
@@ -192,6 +642,8 @@ export class PartialMesh {
         if (!fromId || fromId === selfId || fromId === 'bootstrap-relay') break;
         if (!this.discoveredPeers.has(fromId)) {
           this.discoveredPeers.add(fromId);
+          // Clear backoff when we see a fresh announcement; network conditions may have improved
+          this.clearPeerConnectFailure(fromId);
           this.emit('peer:discovered', fromId);
           if (this.config.autoConnect) this.maintainPeerConnections();
         }
@@ -203,6 +655,8 @@ export class PartialMesh {
           const peerId = this.normalizePeerId(p.peer_id);
           if (peerId && peerId !== selfId && !this.discoveredPeers.has(peerId)) {
             this.discoveredPeers.add(peerId);
+            // Clear backoff when we discover a peer; network conditions may have improved
+            this.clearPeerConnectFailure(peerId);
             this.emit('peer:discovered', peerId);
           }
         });
@@ -221,20 +675,19 @@ export class PartialMesh {
         const sessionId = msg.session_id;
         if (sessionId) this.peerSessionIds.set(fromId, sessionId);
         this.handleOffer(fromId, { type: 'offer', sdp: msg.body?.sdp });
-        // Re-announce immediately to flush any additional queued messages (e.g. ICE candidates)
-        this.sendAnnounce();
+        // Do NOT announce here: announcing after receiving a signal creates a feedback
+        // cascade (receive → announce → server delivers more → receive → ...) that spins
+        // at 150ms intervals and pegs CPU. The periodic 1-second timer handles polling.
         break;
       }
       case 'answer': {
         if (!fromId || fromId === selfId) break;
         this.handleAnswer(fromId, { type: 'answer', sdp: msg.body?.sdp });
-        this.sendAnnounce();
         break;
       }
       case 'ice_candidate': {
         if (!fromId || fromId === selfId) break;
         this.handleIceCandidate(fromId, msg.body?.candidate);
-        this.sendAnnounce();
         break;
       }
       case 'error': {
@@ -249,57 +702,32 @@ export class PartialMesh {
   /**
    * Initialize and connect to the signaling server
    */
-  async init(): Promise<void> {
-    // Generate stable peer identity for this session.
-    this.clientId = this.generateId();
+  init(): void {
+    this.destroyed = false;
+    this.bindLifecycleListeners();
+
+    // Keep identity stable across reloads in the same tab/session so one tab
+    // does not temporarily appear as multiple peers.
+    this.clientId = this.getOrCreateClientId();
     this.instanceId = this.generateId('inst');
 
     // Normalize scheme: https→wss, http→ws.
     const rawUrl = this.config.signalingServer;
-    const signalingUrl = rawUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+    this.signalingUrl = rawUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
 
-    return new Promise<void>((resolve, reject) => {
-      this.ws = new WebSocket(signalingUrl);
-
-      this.ws.onopen = () => {
-        this.emit('signaling:connected', { clientId: this.clientId! });
-        this.sendAnnounce();
-        this.sendDiscover();
-
-        if (this.config.autoDiscover) {
-          // Periodically re-announce — this flushes queued relay messages (peer.ooo stores
-          // directed messages in D1 and delivers them on the recipient's next announce).
-          if (this.announceTimer) clearInterval(this.announceTimer);
-          this.announceTimer = setInterval(() => {
-            this.sendAnnounce();
-            this.sendDiscover();
-          }, 1_000);
-        }
-
-        if (this.config.autoConnect) {
-          this.startMaintenanceLoop();
-        }
-
-        resolve();
-      };
-
-      this.ws.onmessage = (event: MessageEvent) => {
-        try {
-          this.handlePspMessage(JSON.parse(event.data as string));
-        } catch {
-          // ignore malformed messages
-        }
-      };
-
-      this.ws.onclose = () => {
-        this.emit('signaling:disconnected');
-      };
-
-      this.ws.onerror = (error: Event) => {
-        this.emit('signaling:error', error);
-        reject(error);
-      };
-    });
+    // Fire-and-forget: WebSocket connects in the background.
+    // Keep jitter small so startup latency stays low while still reducing
+    // synchronized connect bursts across many tabs.
+    // Track status via signaling:connected / signaling:disconnected events.
+    if (this.initialConnectTimer) {
+      clearTimeout(this.initialConnectTimer);
+      this.initialConnectTimer = null;
+    }
+    const initialJitterMs = Math.floor(Math.random() * 200);
+    this.initialConnectTimer = setTimeout(() => {
+      this.initialConnectTimer = null;
+      this.connectSignaling();
+    }, initialJitterMs);
   }
 
   private startMaintenanceLoop(): void {
@@ -319,6 +747,13 @@ export class PartialMesh {
   private maybeHardResetUnderConnected(): void {
     const thresholdMs = this.config.underConnectedResetMs;
     if (!thresholdMs || thresholdMs <= 0) return;
+
+    // Hidden tabs are heavily throttled and may appear falsely under-connected.
+    // Don't schedule hard resets while hidden.
+    if (this.isDocumentHidden()) {
+      this.underConnectedSinceMs = null;
+      return;
+    }
 
     const connected = this.getConnectedPeers().length;
     const hasEnoughCandidates = this.discoveredPeers.size >= this.config.minPeers;
@@ -367,6 +802,9 @@ export class PartialMesh {
     this.peers.clear();
     this.connecting.clear();
 
+    // Clear peer reconnect backoff state so we can immediately retry after reset
+    this.peerReconnectState.clear();
+
     // Re-announce to refresh discovery state in the signaling layer.
     try {
       this.sendAnnounce();
@@ -402,9 +840,23 @@ export class PartialMesh {
 
     let peerConnection = this.peers.get(normalizedPeerId);
 
-    // If both sides tried to initiate at once, prefer accepting the remote offer.
-    // Simple-peer can get stuck if an initiator receives an offer while negotiating.
+    // Soft max admission control for new inbound peers.
+    if (!peerConnection) {
+      const hardMaxPeers = this.getHardMaxPeers();
+      if (this.getConnectedPeers().length + this.connecting.size >= hardMaxPeers) {
+        return;
+      }
+    }
+
+    // If both sides initiated simultaneously (offer glare), resolve deterministically:
+    // smaller ID remains initiator; larger ID accepts remote offer and becomes responder.
+    // This avoids the broken state where both peers switch to responder and then reject answers.
     if (peerConnection?.initiator) {
+      const keepLocalInitiator = !!selfId && selfId < normalizedPeerId;
+      if (keepLocalInitiator) {
+        // Ignore remote offer: our local offer is canonical for this pair.
+        return;
+      }
       try {
         peerConnection.peer.destroy();
       } catch {
@@ -416,8 +868,11 @@ export class PartialMesh {
     }
 
     if (!peerConnection) {
-      // Create peer connection as non-initiator
+      // Create responder when offer arrives.
       peerConnection = this.createPeerConnection(normalizedPeerId, false);
+    } else {
+      // Start/restart timeout when a fresh offer is received.
+      this.armConnectionTimeout(normalizedPeerId);
     }
 
     try {
@@ -486,25 +941,7 @@ export class PartialMesh {
     };
 
     // If a connection stalls (no 'connect' / 'error' / 'close'), tear it down and retry.
-    const existingTimer = this.connectionTimers.get(peerId);
-    if (existingTimer) clearTimeout(existingTimer);
-
-    const timer = setTimeout(() => {
-      const current = this.peers.get(peerId);
-      if (!current || current.connected) return;
-      if (current.peer.destroyed) return;
-
-      this.connecting.delete(peerId);
-      this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
-      try {
-        current.peer.destroy();
-      } catch {
-        // ignore
-      }
-      this.removePeer(peerId);
-    }, this.config.connectionTimeoutMs);
-
-    this.connectionTimers.set(peerId, timer);
+    this.armConnectionTimeout(peerId);
 
     peer.on('signal', (signal: any) => {
       // Send signal through PSP
@@ -517,12 +954,13 @@ export class PartialMesh {
       } else if (signal.candidate) {
         this.sendPsp('ice_candidate', { candidate: signal.candidate }, peerId, sessionId);
       }
-      // Re-announce immediately so the other side receives any queued replies on their next announce
-      this.sendAnnounce();
+      // Debounced re-announce so rapid ICE bursts don't generate one announce per candidate
+      this.debouncedAnnounce();
     });
 
     peer.on('connect', () => {
       peerConnection.connected = true;
+      this.clearPeerConnectFailure(peerId);
       this.connecting.delete(peerId);
       const t = this.connectionTimers.get(peerId);
       if (t) {
@@ -546,6 +984,9 @@ export class PartialMesh {
     });
 
     peer.on('close', () => {
+      // Only penalise if we never reached 'connected' — a clean disconnect of a
+      // healthy peer should not block future reconnects with backoff.
+      if (!peerConnection.connected) this.notePeerConnectFailure(peerId);
       this.connecting.delete(peerId);
       const t = this.connectionTimers.get(peerId);
       if (t) {
@@ -556,6 +997,7 @@ export class PartialMesh {
     });
 
     peer.on('error', (err: any) => {
+      if (!peerConnection.connected) this.notePeerConnectFailure(peerId);
       this.connecting.delete(peerId);
       const t = this.connectionTimers.get(peerId);
       if (t) {
@@ -571,44 +1013,68 @@ export class PartialMesh {
   }
 
   /**
-   * Maintain the target number of peer connections
+   * Compute XOR distance between two hex peer IDs.
+   * Returns a hex string that sorts lexicographically by distance (smaller = closer).
+   */
+  private xorDistance(a: string, b: string): string {
+    const len = Math.max(a.length, b.length);
+    const hexA = a.padStart(len, '0');
+    const hexB = b.padStart(len, '0');
+    let result = '';
+    for (let i = 0; i < len; i += 2) {
+      const byteA = parseInt(hexA.slice(i, i + 2), 16) || 0;
+      const byteB = parseInt(hexB.slice(i, i + 2), 16) || 0;
+      result += (byteA ^ byteB).toString(16).padStart(2, '0');
+    }
+    return result;
+  }
+
+  /**
+   * Maintain the target number of peer connections.
+   * Candidates are ranked by XOR distance from self so the mesh naturally
+   * organises into a Kademlia-like topology — nearby peers connect first.
    */
   private maintainPeerConnections(): void {
-    const currentPeerCount = this.peers.size;
+    if (!this.isSignalingOpen()) return;
+
+    const selfId = this.normalizePeerId(this.clientId);
+    const currentPeerCount = this.getConnectedPeers().length;
     const connectingCount = this.connecting.size;
     const totalInProgress = currentPeerCount + connectingCount;
 
-    if (totalInProgress < this.config.minPeers) {
-      // Need more connections
-      const needed = this.config.minPeers - totalInProgress;
+    if (totalInProgress < this.config.maxPeers) {
+      // Need more connections — fill up to maxPeers, not just minPeers,
+      // so that later-joining peers can always get connections from already-connected ones.
+      const needed = this.config.maxPeers - totalInProgress;
       const available = Array.from(this.discoveredPeers).filter(
-        peerId => !this.peers.has(peerId) && !this.connecting.has(peerId)
+        peerId => !this.peers.has(peerId) && !this.connecting.has(peerId) && this.canAttemptPeerConnect(peerId)
       );
 
       if (available.length === 0) return;
 
-      // Avoid all peers picking the same "first" discovered peer by rotating the list.
-      // This reduces thundering-herd behavior and improves overall convergence.
-      const selfId = this.normalizePeerId(this.clientId);
-      const sorted = available.slice().sort();
-      let offset = 0;
-      if (selfId) {
-        let hash = 0;
-        for (let i = 0; i < selfId.length; i++) {
-          hash = (hash * 31 + selfId.charCodeAt(i)) >>> 0;
-        }
-        offset = sorted.length ? hash % sorted.length : 0;
-      }
+      // Sort by XOR distance from self — connect to nearest peers first.
+      const sorted = selfId
+        ? available.slice().sort((a, b) => {
+            const da = this.xorDistance(selfId, a);
+            const db = this.xorDistance(selfId, b);
+            return da < db ? -1 : da > db ? 1 : 0;
+          })
+        : available.slice().sort();
 
       for (let i = 0; i < Math.min(needed, sorted.length); i++) {
-        const peerId = sorted[(offset + i) % sorted.length];
-        this.connectToPeer(peerId);
+        this.connectToPeer(sorted[i]);
       }
-    } else if (currentPeerCount > this.config.maxPeers) {
-      // Too many connections, need to drop some
-      const toDrop = currentPeerCount - this.config.maxPeers;
-      const peerIds = Array.from(this.peers.keys());
-      
+    } else if (currentPeerCount > this.getHardMaxPeers()) {
+      // Too many connections beyond soft max — drop the farthest peers first.
+      const toDrop = currentPeerCount - this.getHardMaxPeers();
+      const peerIds = selfId
+        ? this.getConnectedPeers().slice().sort((a, b) => {
+            const da = this.xorDistance(selfId, a);
+            const db = this.xorDistance(selfId, b);
+            return da > db ? -1 : da < db ? 1 : 0; // descending: farthest first
+          })
+        : this.getConnectedPeers();
+
       for (let i = 0; i < toDrop; i++) {
         this.disconnectFromPeer(peerIds[i]);
       }
@@ -621,24 +1087,53 @@ export class PartialMesh {
   public connectToPeer(peerId: string): void {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
-    if (!normalizedPeerId ||
-        this.peers.has(normalizedPeerId) || 
-        this.connecting.has(normalizedPeerId) || 
-        normalizedPeerId === selfId) {
+    if (!this.isSignalingOpen() ||
+        !normalizedPeerId ||
+        this.peers.has(normalizedPeerId) ||
+        this.connecting.has(normalizedPeerId) ||
+        normalizedPeerId === selfId ||
+        !this.canAttemptPeerConnect(normalizedPeerId)) {
       return;
     }
 
-    if (this.peers.size >= this.config.maxPeers) {
-      console.warn('Max peers reached, cannot connect to more peers');
+    if (this.getConnectedPeers().length + this.connecting.size >= this.getHardMaxPeers()) {
+      console.warn('Hard max peers reached, cannot connect to more peers');
       return;
     }
 
-    // Deterministic initiator selection prevents both sides from creating offers.
-    // If clientId isn't known yet (should be rare here), default to initiating.
+    // Deterministic initiator selection: smaller ID always initiates.
     const initiator = selfId ? selfId < normalizedPeerId : true;
+    if (!initiator) return;
 
     this.connecting.add(normalizedPeerId);
-    this.createPeerConnection(normalizedPeerId, initiator);
+    this.createPeerConnection(normalizedPeerId, true);
+  }
+
+  /**
+   * Trigger an immediate best-effort connectivity pass.
+   * Useful when application traffic is queued but no peers are currently connected.
+   */
+  public nudgeConnectivity(reason: string = 'manual'): void {
+    if (this.destroyed) return;
+    if (!this.isSignalingOpen()) return;
+    try {
+      this.sendAnnounce();
+      this.sendDiscover();
+    } catch {
+      // ignore
+    }
+    if (this.config.autoConnect) {
+      try {
+        this.maintainPeerConnections();
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      console.warn(`[PartialMesh] nudgeConnectivity(${reason}) connected=${this.getConnectedPeers().length} discovered=${this.discoveredPeers.size}`);
+    } catch {
+      // ignore
+    }
   }
 
   /**
@@ -774,6 +1269,18 @@ export class PartialMesh {
    * Disconnect from all peers and close signaling connection
    */
   public destroy(): void {
+    this.destroyed = true;
+    this.unbindLifecycleListeners();
+    this.stopHeartbeat();
+    this.clearReconnectTimer();
+    this.reconnectAttempts = 0;
+    this.hasSignalingConnectedOnce = false;
+
+    if (this.initialConnectTimer) {
+      clearTimeout(this.initialConnectTimer);
+      this.initialConnectTimer = null;
+    }
+
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
@@ -796,14 +1303,17 @@ export class PartialMesh {
     this.clientId = null;
     this.instanceId = null;
     this.peerSessionIds.clear();
+    this.peerReconnectState.clear();
+    this.signalingUrl = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
 
     // Stop periodic announce
-    if (this.announceTimer) {
-      clearInterval(this.announceTimer);
-      this.announceTimer = null;
+    if (this.announceDebounceTimer) {
+      clearTimeout(this.announceDebounceTimer);
+      this.announceDebounceTimer = null;
     }
+    this.stopAnnounceLoop();
 
     // Disconnect from signaling server
     if (this.ws) {
